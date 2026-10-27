@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+secrets.json
+*.secrets.json
+results/
+*.log
+tests/tmp*/

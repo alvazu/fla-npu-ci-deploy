@@ -1,0 +1,23 @@
+name: Deployment tooling tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate shell syntax
+        run: |
+          bash -n deploy.sh test-ci.sh
+          bash -n scripts/vpn-proxy.sh
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
