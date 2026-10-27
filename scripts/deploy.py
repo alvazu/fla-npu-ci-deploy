@@ -138,6 +138,25 @@ def writable_directory(path):
     return path.is_dir() and not path.is_symlink() and os.access(path, os.R_OK | os.W_OK | os.X_OK)
 
 
+def storage_layout(root):
+    return ((root, 0o775), (root / "tmp", 0o2775), (root / "cache_root", 0o2775),
+            (root / "tmp/npu-locks", 0o2775))
+
+
+def prepare_storage(root):
+    """Create persistent CI directories once; preserve existing directory ownership/modes."""
+    for directory, mode in storage_layout(root):
+        if directory.is_symlink():
+            raise DeployError("Refusing a symlink in the CI storage layout")
+        created = not directory.exists()
+        try:
+            directory.mkdir(mode=mode, parents=True, exist_ok=True)
+            if created:
+                directory.chmod(mode)
+        except OSError:
+            raise DeployError("CI storage is not writable; use --setup-host once or ask the host administrator") from None
+
+
 def setup_host(root):
     """Only the explicit bootstrap flag grants sudo operations. Never restart users/services."""
     user = getpass.getuser()
@@ -168,10 +187,10 @@ def setup_host(root):
         pass
     run(["sudo", "-n", "usermod", "-aG", ",".join(groups), user])
     # Do not recursively chown a shared CI root, its caches, or another user's files.
-    for path, mode in ((root, "0775"), (root / "tmp", "2775"), (root / "cache_root", "2775")):
+    for path, mode in storage_layout(root):
         if path.is_symlink():
             raise DeployError("Refusing a symlink in the CI storage layout")
-        run(["sudo", "-n", "install", "-d", "-m", mode, "-g", "fla-npu-ci", str(path)])
+        run(["sudo", "-n", "install", "-d", "-m", format(mode, "04o"), "-g", "fla-npu-ci", str(path)])
     run(["sudo", "-n", "loginctl", "enable-linger", user])
     required = {grp.getgrnam(g).gr_gid for g in groups}
     if not required.issubset(set(os.getgroups()) | {os.getgid()}):
@@ -182,7 +201,7 @@ def preflight(root, image, *, require_image=True):
     checks = {}
     for command in ("bash", "curl", "tar", "gzip", "unzip", "sha256sum", "docker", "systemctl", "loginctl", "flock"):
         checks["command:" + command] = bool(shutil.which(command))
-    checks["storage"] = all(writable_directory(p) for p in (root, root / "tmp", root / "cache_root"))
+    checks["storage"] = all(writable_directory(path) for path, _ in storage_layout(root))
     linger = run(["loginctl", "show-user", getpass.getuser(), "--property=Linger", "--value"], check=False)
     checks["linger"] = linger.returncode == 0 and linger.stdout.strip() == "yes"
     manager = systemctl("show-environment", check=False)
@@ -572,12 +591,7 @@ def main(argv=None):
         args.secrets = load_secret_file(args.secret_file) if args.secret_file else {}
         if args.setup_host:
             setup_host(root)
-        else:
-            for directory in (root, root / "tmp", root / "cache_root"):
-                try:
-                    directory.mkdir(parents=True, exist_ok=True)
-                except OSError:
-                    raise DeployError("CI storage is not writable; use --setup-host once or ask the host administrator") from None
+        prepare_storage(root)
         require_checks(preflight(root, args.image, require_image=not args.build_image))
         ensure_proxy(args, root)
         if args.build_image:

@@ -17,6 +17,33 @@ SPEC.loader.exec_module(deploy)
 
 
 class DeployTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX CI directory modes")
+    def test_prepare_storage_creates_all_persistent_paths_with_shared_modes(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory) / "ci"
+            previous = os.umask(0o077)
+            try:
+                deploy.prepare_storage(root)
+            finally:
+                os.umask(previous)
+            for path, mode in deploy.storage_layout(root):
+                self.assertTrue(path.is_dir())
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+            self.assertTrue((root / "tmp/npu-locks").is_dir())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX CI directory modes")
+    def test_prepare_storage_preserves_existing_permissions_and_lock_files(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory) / "ci"
+            deploy.prepare_storage(root)
+            root.chmod(0o770)
+            locks = root / "tmp/npu-locks"
+            lock_file = locks / "fla-npu-ci-npu-0.lock"
+            lock_file.write_text("retained")
+            deploy.prepare_storage(root)
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o770)
+            self.assertEqual(lock_file.read_text(), "retained")
+
     @unittest.skipUnless(os.name == "posix", "Linux deployment paths")
     def test_validate_root_rejects_host_roots_and_user_home(self):
         for root in ("/", "/tmp", "/var/tmp", "/etc", "/home/ubuntu", str(Path.home())):
