@@ -147,7 +147,8 @@ def storage_layout(root, *, proxy_only=False):
     directories = ((root, 0o775), (root / "tmp", 0o2775))
     if proxy_only:
         return directories
-    return (*directories, (root / "cache_root", 0o2775), (root / "tmp/npu-locks", 0o2775))
+    return (*directories, (root / "cache_root", 0o2775), (root / "pkg-cache", 0o2775),
+            (root / "tmp/npu-locks", 0o2775))
 
 
 def prepare_storage(root, *, proxy_only=False):

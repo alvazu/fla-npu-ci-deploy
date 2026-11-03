@@ -320,6 +320,12 @@ exit 0
         self.assertEqual(e["environment"]["CI_ATK_OPS"], "")
         self.assertEqual(e["build_plan"]["atk_operators"], "")
 
+    def test_package_refresh_uses_persistent_host_cache(self):
+        p, e, _ = self.invoke("--build-kind", "base", "--update-package")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(e["environment"]["CI_UPDATE_PACKAGE"], "true")
+        self.assertEqual(e["environment"]["CI_PACKAGE_CACHE"], str(self.ci_root / "pkg-cache"))
+
     def test_prepare_only_fetches_pr_without_docker_or_npu(self):
         self.git("update-ref", "refs/pull/7/head", "HEAD")
         p, e, _ = self.invoke("--pr", "7", "--remote", str(self.repo), "--prepare-only")

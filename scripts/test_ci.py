@@ -401,6 +401,10 @@ class Run:
         self.host_tmp.mkdir(parents=True, exist_ok=False)
         self.host_scratch.mkdir(parents=True, exist_ok=False)
         (self.root / "cache_root").mkdir(parents=True, exist_ok=True)
+        package_cache = self.root / "pkg-cache"
+        if not package_cache.exists():
+            package_cache.mkdir(parents=True, mode=0o2775, exist_ok=True)
+            package_cache.chmod(0o2775)
         (self.root / "tmp" / "npu-locks").mkdir(parents=True, exist_ok=True)
         if image:
             self.restore_permissions()
@@ -419,6 +423,8 @@ class Run:
                       "CI_CONTAINER_NAME": self.container, "CI_TMPDIR": "/tmp/fla-npu-ci",
                       "CI_HOST_TMPDIR": str(self.host_tmp), "TMPDIR": str(self.host_scratch),
                       "CI_CACHE_ROOT": str(self.root / "cache_root"),
+                      "CI_PACKAGE_CACHE": str(self.root / "pkg-cache"),
+                      "CI_UPDATE_PACKAGE": str(self.args.update_package).lower(),
                       "CI_NPU_LOCK_DIR": str(self.root / "tmp" / "npu-locks"),
                       "CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK": "true",
                       "CI_RUN_EXAMPLE_ST": "true",
@@ -624,6 +630,8 @@ def parser():
                    help="comma-separated ATK accuracy operators; null disables all ATK validation")
     p.add_argument("--device-id", type=device_id, default="", help="physical NPU ID; omitted means automatic selection")
     p.add_argument("--base-ref", default="main", help="Daily base package branch, such as main or v0.6.0")
+    p.add_argument("--update-package", action="store_true",
+                   help="refresh the shared Daily package cache before a base/incremental/torch build")
     p.add_argument("--prepare-only", action="store_true", help="prepare source and retain evidence without Docker/NPU work")
     p.add_argument("--image")
     p.add_argument("--dockerfile")

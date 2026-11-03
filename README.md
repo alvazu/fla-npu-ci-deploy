@@ -31,7 +31,7 @@ bash deploy.sh --platform a5 --setup-host
 
 `--setup-host` 明确允许一次性的定向 sudo 操作：准备基础命令、访问组、目录权限和 linger。新增组尚未进入当前登录或 systemd 用户管理器时，脚本会返回明确错误，待现有用户任务结束并刷新登录会话后重新执行。脚本保留正在运行的用户服务。日常部署、检查和 CI 测试都使用普通用户，无需 sudo。
 
-部署脚本统一创建 `ci/tmp`、`ci/cache_root` 和 `ci/tmp/npu-locks` 等持久基础目录；初始化时临时目录、缓存和设备锁目录使用 `2775`，现有目录与锁文件在普通部署重跑时保持原样。Workflow 直接使用部署好的主机环境，无需额外增加目录或权限检查步骤。宿主 `TMPDIR` 使用已准备好的静态 `ci/tmp` 根目录，清理时保留该目录；每次运行独立的 `CI_HOST_TMPDIR` 由 CI 容器调用脚本创建并按本次运行清理。
+部署脚本统一创建 `ci/tmp`、`ci/cache_root`、`ci/pkg-cache` 和 `ci/tmp/npu-locks` 等持久基础目录；初始化时临时目录、缓存和设备锁目录使用 `2775`，现有目录与锁文件在普通部署重跑时保持原样。Workflow 直接使用部署好的主机环境，无需额外增加目录或权限检查步骤。宿主 `TMPDIR` 使用已准备好的静态 `ci/tmp` 根目录，清理时保留该目录；每次运行独立的 `CI_HOST_TMPDIR` 由 CI 容器调用脚本创建并按本次运行清理。
 
 镜像默认要求已准备好：
 
@@ -141,7 +141,7 @@ bash test-ci.sh --platform a5 --repo /path/to/flash-linear-attention-npu \
 
 该模式仍核验源码能力并保留 SHA、网络尝试和清理证据，但 `full_ci_passed=false`。直连成功时不会触发代理回退；需要验证失败分支时，使用隔离测试环境定向制造直连失败并核对代理重试成功，保留生产 Git/网络配置。
 
-一律使用所选 PR/checkout 自身的 `ci/`。不再提供 `--ci-ref` 或其他可信 CI 覆盖；旧源码与当前构建/报告契约不兼容时直接提示修复源码。线上 CI 测试固定 base 与 PR 合并结果，本工具 `--pr` 直接测试 PR head，二者不能混为同一份验证。
+本地工具使用所选 PR/checkout 自身的 `ci/`，不提供 `--ci-ref` 覆盖；旧源码与当前构建/报告契约不兼容时直接提示修复源码。线上脚本来源由所选 workflow 决定，见下文策略说明。线上 CI 测试固定 base 与 PR 合并结果，本工具 `--pr` 直接测试 PR head，二者不能混为同一份验证。
 
 ### 编译、ATK 与设备范围
 
@@ -150,10 +150,11 @@ bash test-ci.sh --platform a5 --repo /path/to/flash-linear-attention-npu \
 | 参数 | 行为 |
 | --- | --- |
 | `--build-kind full` | 通过主仓 `scripts/build_wheel.py` 构建并安装完整目标 SOC wheel |
-| `--build-kind incremental --build-ops a,b` | 下载完整 Daily 底包，只构建指定算子并经主仓 overlay 入口安全叠加 |
+| `--build-kind incremental --build-ops a,b` | 获取缓存中的完整 Daily 底包，只构建指定算子并经主仓 overlay 入口安全叠加 |
 | `--build-kind torch` | 安装完整 Daily 底包，只重建 torch_custom |
 | `--build-kind base` | 只安装完整 Daily 底包，不编译 |
 | `--base-ref main` | 选择底包对应的真实 PR 目标分支，默认 `main`；维护分支使用对应 `vX.Y.Z` |
+| `--update-package` | 使用底包的本次验证前强制刷新匹配缓存；全量编译无需底包，不下载 |
 | `--atk-ops a,b` | 追加精度验证算子，与 `--build-ops` 合并去重；最终集合为空时不运行 ATK |
 | `--atk-ops null` | 显式跳过 ATK，覆盖 `--build-ops` 自动加入的集合；编译与其他验证照常 |
 | `--device-id N` | 指定宿主物理 NPU 编号；省略则自动择卡，容器测试使用逻辑设备 `0` |
@@ -168,9 +169,25 @@ bash test-ci.sh --platform a5 --repo /path/to/flash-linear-attention-npu \
 # 仅底包验证，不编译。
 bash test-ci.sh --platform a5 --repo /path/to/flash-linear-attention-npu \
   --build-kind base --base-ref main
+
+# 强制获取远程最新匹配底包，然后运行本次底包验证。
+bash test-ci.sh --platform a5 --repo /path/to/flash-linear-attention-npu \
+  --build-kind base --base-ref main --update-package
 ```
 
 底包选择、分支/SOC/架构校验、ABI 检查和 overlay 由待测主仓 `ci/prepare_ci_package.py` 执行。完整底包来自华为云 nightly 源；匹配包缺失或 ABI 不兼容时应补发底包或改用完整构建，不能混用其他分支/平台包或将部分 `.run` 直接覆盖完整包。
+
+本地与线上共用每台宿主的 `<ci-root>/pkg-cache`，默认 `/home/huangjunzhe/ci/pkg-cache`；工具设置 `CI_PACKAGE_CACHE`，容器内挂载为 `/ci-pkg-cache`。缓存按目标分支、SOC、CPU、Python/ABI 标签、发布源及指定版本隔离。北京时间每日第一次需要底包时下载远程最新匹配 wheel，日内校验 SHA256 和 wheel 元数据后复用；同维度下载使用进程锁，校验后原子发布。刷新失败明确报错，不沿用旧日底包。`--update-package` 传入 `CI_UPDATE_PACKAGE=true` 强制刷新，不是独立的只下载模式。
+
+仅刷新单台机器、不运行编译和 NPU 验证时，使用待测主仓的镜像入口：
+
+```bash
+CI_PACKAGE_CACHE=/home/huangjunzhe/ci/pkg-cache CI_BASE_REF=main \
+  CI_SOC=ascend950 CI_IMAGE=fla-npu-ci:9.1.0-950 \
+  bash /path/to/flash-linear-attention-npu/ci/update_package_cache.sh
+```
+
+A2 改用 `CI_SOC=ascend910b CI_IMAGE=fla-npu-ci:9.1.0-910b`，并按需先加载代理。该入口要求预置匹配镜像，只读挂载源码，在镜像内执行 `python ci/prepare_ci_package.py --update-package`；只下载、校验并输出缓存版本，不安装、不占用 NPU。
 
 默认顺序执行六阶段：`environment-contracts`、`opp-package`、`standalone-layout`、`torch-adapter`、`gdr-example-st`、`atk-accuracy`。未选 ATK 时，最后阶段必须以 `no ATK operators selected` 明确跳过；选中时必须成功。`--stage NAME` 执行截至该阶段的前缀；局部验证始终标记 `full_ci_passed=false`。quick/full 都检查环境、已安装布局、GDR 和同一选中集合的 ATK；除编译外，full 额外执行全部 PyTorch 适配测试。
 
@@ -189,7 +206,8 @@ ATK 只通过源码中的 `tests/atk/run_test_cpu.sh` 调用。每个选中算�
 ├── actions-runner/      # 注册身份与工作目录
 ├── clashctl/            # 私有订阅、mihomo 配置与工具
 ├── vpn-proxy.sh
-├── cache_root/          # 多次测试复用的缓存
+├── cache_root/          # 多次测试复用的编译缓存
+├── pkg-cache/           # 按北京时间每日刷新的完整 Daily wheel 缓存
 ├── tmp/
 │   ├── npu-locks/       # 与线上新 CI 共用的持久设备锁
 │   ├── source-locks/    # 同一源码目录的本地验证锁
@@ -216,16 +234,20 @@ ATK 只通过源码中的 `tests/atk/run_test_cpu.sh` 调用。每个选中算�
 
 ## 线上 CI 与技能
 
-线上文件分类、独立触发名单、Admin 确认和双平台状态规则以主仓 [仓库规则](https://github.com/flashserve/flash-linear-attention-npu/blob/main/docs/repository-rules.md) 及所选 Actions 定义分支的实现为准。本工具不改变仓库权限或分支保护。
+线上文件分类、触发权限、脚本来源和双平台状态规则以主仓 [仓库规则](https://github.com/flashserve/flash-linear-attention-npu/blob/main/docs/repository-rules.md) 及所选 Actions 定义分支的实际实现为准。部分编译与缓存 PR 使用仓库 Admin 触发、固定 workflow SHA 的可信 `ci/`，仅保留合并后 PR 的 `ci/example_st_cases.json`；“独立权限与CI来源策略PR”改为独立用户名名单触发、使用 PR 的 `ci/`，并要求 CI 文件修改由名单内 Admin 显式 `ci_modified=true` 确认。本工具不改变线上策略或分支保护。
 
 ```text
 /run-npu-ci quick
 /run-npu-ci quick atk-ops=chunk_fwd_o device-id=0
 /run-npu-ci quick atk-ops=null
-/run-npu-ci full ci_modified=true
+/run-npu-ci full
+/update-package
+/update-package ci_ref=<CI定义分支>
 ```
 
-触发人必须在默认分支 `.github/npu-ci-users.json` 名单中。非 Markdown 的 `ci/`、`.github/` 修改还要求名单内仓库 Admin 带 `ci_modified=true`；CI 文件自身不触发编译。`atk-ops` 追加自动集合，`atk-ops=null` 则覆盖整个集合并跳过 ATK；`full` 不自动扩大 ATK 范围。`ops=` 只运行 01/02 编译诊断，不满足正式门禁；不能和 `full`、`atk-ops` 组合。每次触发及最终结果新增评论。
+`atk-ops` 追加自动集合，`atk-ops=null` 则覆盖整个集合并跳过 ATK；`full` 不自动扩大 ATK 范围。`ops=` 只运行 01/02 编译诊断，不满足正式门禁；不能和 `full`、`atk-ops` 组合。每次触发及最终结果新增评论。
+
+`/update-package` 刷新 PR 目标分支的 Daily 底包，可选 `ci_ref` 选择 Actions 定义分支。任务各调度一个 A2 和一个 A5 runner，只刷新被选主机的匹配缓存；不编译、不安装、不运行 NPU 测试。其他同平台主机在其当天首次需要底包的 CI 自动刷新；该命令不代表整个平台所有主机均已刷新。触发与重跑遵循所选 workflow 的权限策略。
 
 本仓提供两个可由 Codex 等代理按路径读取的技能：
 

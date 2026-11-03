@@ -22,6 +22,10 @@ bash test-ci.sh --platform a5 --repo /path/to/source \
 
 本地默认 `--build-kind full`，不会自动模拟 GitHub 文件分类。按用户要求或线上失败报告填写 `full/incremental/torch/base`、`--build-ops`、`--atk-ops`；增量编译算子自动并入 ATK 集合，手动 ATK 在此基础上追加。显式 `--atk-ops null` 覆盖整个集合并跳过 ATK，不影响编译或其他阶段。底包模式的 `--base-ref` 必须对应真实 PR 目标分支。`--mode full` 强制全量，并比 quick 多运行完整 PyTorch 适配测试；环境、布局、GDR 和同一 ATK 集合的验证范围一致。`--device-id` 是宿主物理卡，容器测试使用逻辑设备 0。
 
+Daily 底包与线上共用 `<ci-root>/pkg-cache`，默认 `/home/huangjunzhe/ci/pkg-cache`，由 `CI_PACKAGE_CACHE` 传入容器。按分支、SOC、CPU、Python/ABI、发布源和指定版本隔离；北京时间每日第一次需要底包时下载最新匹配 wheel，日内校验 SHA256 和元数据后复用。`--update-package` 为本次 base/incremental/torch 验证强制刷新，仍继续执行所选 CI；full 无需下载底包。刷新失败应修复源或网络，不沿用旧日包。
+
+用户只要求单机刷新缓存时，使用待测主仓 `ci/update_package_cache.sh`，指定 `CI_BASE_REF`、`CI_SOC`、`CI_IMAGE`、`CI_PACKAGE_CACHE`，按需先加载代理。该入口在预置匹配镜像内以只读源码执行 `python ci/prepare_ci_package.py --update-package`，只下载校验，不安装、不编译、不申请 NPU；不要误用本地 `--update-package` 执行整套验证。
+
 `--stage` 只执行截至目标阶段的前缀。需要排查初始化可用 `--stage environment-contracts`，但局部结果不能作为整套 CI 通过证据。六阶段、代理重试和取证语义以当前脚本为准；旧源码不支持当前契约时报告版本不匹配，不叠加其他 CI 目录绕过。
 
 只验收拉取与源码契约时使用 `--pr N --prepare-only`，不启动 Docker/NPU，`full_ci_passed=false`。先无代理直连，失败后才加载代理重试；记录两次尝试与最终 SHA。需要触发失败分支时使用隔离环境，不改生产 Git/网络配置。
@@ -34,10 +38,14 @@ bash test-ci.sh --platform a5 --repo /path/to/source \
 /run-npu-ci quick
 /run-npu-ci quick atk-ops=chunk_fwd_o device-id=0
 /run-npu-ci quick atk-ops=null
-/run-npu-ci full ci_modified=true
+/run-npu-ci full
+/update-package
+/update-package ci_ref=<CI定义分支>
 ```
 
-默认分支 `.github/npu-ci-users.json` 决定触发名单；非 Markdown 的 `ci/`、`.github/` 修改还要求名单内仓库 Admin 明确 `ci_modified=true`。`atk-ops` 追加自动选中集合，`atk-ops=null` 则覆盖整个集合并跳过 ATK；`full` 不自动扩大 ATK 集合。`ops=` 仅为 01/02 编译诊断，不满足正式门禁，不能与 `full` 或 `atk-ops` 组合。
+先读取所选 workflow 的实际权限和脚本来源策略：部分编译与缓存 PR 使用仓库 Admin 触发、固定 workflow SHA 的可信 CI，并保留 PR 合并后的 `ci/example_st_cases.json`；“独立权限与CI来源策略PR”使用默认分支 `.github/npu-ci-users.json` 名单和 PR 的 `ci/`，非 Markdown 的 `ci/`、`.github/` 修改还要求名单内 Admin 显式 `ci_modified=true`。本地工具始终使用指定 checkout 的 `ci/`，不能据此推断线上脚本来源。
+
+`atk-ops` 追加自动选中集合，`atk-ops=null` 则覆盖整个集合并跳过 ATK；`full` 不自动扩大 ATK 集合。`ops=` 仅为 01/02 编译诊断，不满足正式门禁，不能与 `full` 或 `atk-ops` 组合。`/update-package` 刷新 PR 目标分支的底包，分别调度一个 A2 和一个 A5 runner，仅刷新被选主机的缓存；不编译、不安装、不运行 NPU 测试。其他同平台机器在其当天首次需要底包的 CI 自动刷新。触发及重跑权限遵循所选 workflow。
 
 ## 失败定位与证据
 
