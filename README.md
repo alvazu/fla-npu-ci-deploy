@@ -155,6 +155,7 @@ bash test-ci.sh --platform a5 --repo /path/to/flash-linear-attention-npu \
 | `--build-kind base` | 只安装完整 Daily 底包，不编译 |
 | `--base-ref main` | 选择底包对应的真实 PR 目标分支，默认 `main`；维护分支使用对应 `vX.Y.Z` |
 | `--atk-ops a,b` | 追加精度验证算子，与 `--build-ops` 合并去重；最终集合为空时不运行 ATK |
+| `--atk-ops null` | 显式跳过 ATK，覆盖 `--build-ops` 自动加入的集合；编译与其他验证照常 |
 | `--device-id N` | 指定宿主物理 NPU 编号；省略则自动择卡，容器测试使用逻辑设备 `0` |
 | `--mode full` | 强制完整 wheel 构建，并额外运行全部 PyTorch 适配测试 |
 
@@ -220,10 +221,11 @@ ATK 只通过源码中的 `tests/atk/run_test_cpu.sh` 调用。每个选中算�
 ```text
 /run-npu-ci quick
 /run-npu-ci quick atk-ops=chunk_fwd_o device-id=0
+/run-npu-ci quick atk-ops=null
 /run-npu-ci full ci_modified=true
 ```
 
-触发人必须在默认分支 `.github/npu-ci-users.json` 名单中。非 Markdown 的 `ci/`、`.github/` 修改还要求名单内仓库 Admin 带 `ci_modified=true`；CI 文件自身不触发编译。`atk-ops` 追加自动集合，`full` 不自动扩大 ATK 范围。`ops=` 只运行 01/02 编译诊断，不满足正式门禁；不能和 `full`、`atk-ops` 组合。每次触发及最终结果新增评论。
+触发人必须在默认分支 `.github/npu-ci-users.json` 名单中。非 Markdown 的 `ci/`、`.github/` 修改还要求名单内仓库 Admin 带 `ci_modified=true`；CI 文件自身不触发编译。`atk-ops` 追加自动集合，`atk-ops=null` 则覆盖整个集合并跳过 ATK；`full` 不自动扩大 ATK 范围。`ops=` 只运行 01/02 编译诊断，不满足正式门禁；不能和 `full`、`atk-ops` 组合。每次触发及最终结果新增评论。
 
 本仓提供两个可由 Codex 等代理按路径读取的技能：
 

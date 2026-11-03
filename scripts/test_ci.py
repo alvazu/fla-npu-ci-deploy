@@ -593,6 +593,15 @@ def operator_list(value):
     return ",".join(sorted(set(item.strip() for item in values)))
 
 
+def atk_operator_list(value):
+    if value.strip() == "null":
+        return "null"
+    operators = operator_list(value)
+    if "null" in operators.split(","):
+        raise argparse.ArgumentTypeError("null disables ATK and cannot be combined with operators")
+    return operators
+
+
 def device_id(value):
     if not value:
         return ""
@@ -611,7 +620,8 @@ def parser():
     p.add_argument("--build-kind", choices=BUILD_KINDS, default="full",
                    help="explicit package plan; full mode always forces a full build")
     p.add_argument("--build-ops", type=operator_list, default="", help="comma-separated incremental build operators")
-    p.add_argument("--atk-ops", type=operator_list, default="", help="comma-separated ATK accuracy operators")
+    p.add_argument("--atk-ops", type=atk_operator_list, default="",
+                   help="comma-separated ATK accuracy operators; null disables all ATK validation")
     p.add_argument("--device-id", type=device_id, default="", help="physical NPU ID; omitted means automatic selection")
     p.add_argument("--base-ref", default="main", help="Daily base package branch, such as main or v0.6.0")
     p.add_argument("--prepare-only", action="store_true", help="prepare source and retain evidence without Docker/NPU work")
@@ -645,8 +655,8 @@ def validate_args(args):
         raise Failure("--build-kind incremental requires --build-ops")
     elif args.build_kind != "incremental" and args.build_ops:
         raise Failure("--build-ops is only valid with --build-kind incremental")
-    # A rebuilt operator always needs ATK accuracy, just as in the GitHub plan.
-    args.atk_ops = operator_list(",".join(filter(None, (args.atk_ops, build_atk_ops))))
+    # Explicit null overrides the automatically selected build operators, as in GitHub CI.
+    args.atk_ops = "" if args.atk_ops == "null" else operator_list(",".join(filter(None, (args.atk_ops, build_atk_ops))))
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", args.base_ref) or ".." in args.base_ref:
         raise Failure("--base-ref must be a branch name without whitespace or '..'")
     if not args.remote or args.remote.startswith("-") or any(c in args.remote for c in ("\r", "\n", "\x00")):

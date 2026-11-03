@@ -118,6 +118,16 @@ class ArgumentsAndFetchTest(unittest.TestCase):
         self.assertEqual((args.build_kind, args.build_ops), ("full", ""))
         self.assertEqual(args.atk_ops, "gdn")
 
+    def test_explicit_null_disables_automatic_atk_for_both_build_modes(self):
+        for mode in ("quick", "full"):
+            with self.subTest(mode=mode):
+                args = self.parse("--mode", mode, "--build-kind", "incremental", "--build-ops", "gdn",
+                                  "--atk-ops", "null")
+                self.assertEqual(args.atk_ops, "")
+        for operators in ("null,gdn", "gdn,null", "null,null"):
+            with self.subTest(operators=operators), self.assertRaises(SystemExit):
+                self.parse("--atk-ops", operators)
+
     def test_invalid_or_ambiguous_plans_are_rejected(self):
         for options in (("--build-kind", "incremental"), ("--build-kind", "base", "--build-ops", "gdn"),
                         ("--remote", "-origin"), ("--base-ref", "a/../b"), ("--fetch-timeout", "0")):
@@ -301,6 +311,14 @@ exit 0
         self.assertEqual(e["environment"]["CI_ATK_OPS"], "gdn,kda")
         self.assertEqual(e["environment"]["CI_DEVICE_ID"], "2")
         self.assertEqual(e["environment"]["CI_BASE_REF"], "v0.6.0")
+
+    def test_null_atk_override_is_forwarded_as_an_empty_selection(self):
+        (self.repo / "tests/atk/run_test_cpu.sh").unlink()
+        p, e, _ = self.invoke("--build-kind", "incremental", "--build-ops", "gdn", "--atk-ops", "null")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(e["environment"]["CI_BUILD_OPS"], "gdn")
+        self.assertEqual(e["environment"]["CI_ATK_OPS"], "")
+        self.assertEqual(e["build_plan"]["atk_operators"], "")
 
     def test_prepare_only_fetches_pr_without_docker_or_npu(self):
         self.git("update-ref", "refs/pull/7/head", "HEAD")

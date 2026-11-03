@@ -20,7 +20,7 @@ bash test-ci.sh --platform a5 --repo /path/to/source \
   --atk-ops chunk_fwd_o --base-ref main --device-id 0
 ```
 
-本地默认 `--build-kind full`，不会自动模拟 GitHub 文件分类。按用户要求或线上失败报告填写 `full/incremental/torch/base`、`--build-ops`、`--atk-ops`；增量编译算子自动并入 ATK 集合，手动 ATK 在此基础上追加。底包模式的 `--base-ref` 必须对应真实 PR 目标分支。`--mode full` 强制全量，并比 quick 多运行完整 PyTorch 适配测试；环境、布局、GDR 和同一 ATK 集合的验证范围一致。`--device-id` 是宿主物理卡，容器测试使用逻辑设备 0。
+本地默认 `--build-kind full`，不会自动模拟 GitHub 文件分类。按用户要求或线上失败报告填写 `full/incremental/torch/base`、`--build-ops`、`--atk-ops`；增量编译算子自动并入 ATK 集合，手动 ATK 在此基础上追加。显式 `--atk-ops null` 覆盖整个集合并跳过 ATK，不影响编译或其他阶段。底包模式的 `--base-ref` 必须对应真实 PR 目标分支。`--mode full` 强制全量，并比 quick 多运行完整 PyTorch 适配测试；环境、布局、GDR 和同一 ATK 集合的验证范围一致。`--device-id` 是宿主物理卡，容器测试使用逻辑设备 0。
 
 `--stage` 只执行截至目标阶段的前缀。需要排查初始化可用 `--stage environment-contracts`，但局部结果不能作为整套 CI 通过证据。六阶段、代理重试和取证语义以当前脚本为准；旧源码不支持当前契约时报告版本不匹配，不叠加其他 CI 目录绕过。
 
@@ -33,10 +33,11 @@ bash test-ci.sh --platform a5 --repo /path/to/source \
 ```text
 /run-npu-ci quick
 /run-npu-ci quick atk-ops=chunk_fwd_o device-id=0
+/run-npu-ci quick atk-ops=null
 /run-npu-ci full ci_modified=true
 ```
 
-默认分支 `.github/npu-ci-users.json` 决定触发名单；非 Markdown 的 `ci/`、`.github/` 修改还要求名单内仓库 Admin 明确 `ci_modified=true`。`atk-ops` 追加自动选中集合；`full` 不自动扩大 ATK 集合。`ops=` 仅为 01/02 编译诊断，不满足正式门禁，不能与 `full` 或 `atk-ops` 组合。
+默认分支 `.github/npu-ci-users.json` 决定触发名单；非 Markdown 的 `ci/`、`.github/` 修改还要求名单内仓库 Admin 明确 `ci_modified=true`。`atk-ops` 追加自动选中集合，`atk-ops=null` 则覆盖整个集合并跳过 ATK；`full` 不自动扩大 ATK 集合。`ops=` 仅为 01/02 编译诊断，不满足正式门禁，不能与 `full` 或 `atk-ops` 组合。
 
 ## 失败定位与证据
 
