@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -50,7 +51,23 @@ class DeployTests(unittest.TestCase):
             with self.subTest(root=root), self.assertRaises(deploy.DeployError):
                 deploy.validate_root(root)
         self.assertEqual(deploy.validate_root("/tmp/fla-ci-test"), Path("/tmp/fla-ci-test"))
-        self.assertEqual(deploy.validate_root("/home/ubuntu/ci"), Path("/home/ubuntu/ci"))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory).resolve() / "ci"
+            self.assertEqual(deploy.validate_root(str(root)), root)
+
+    @unittest.skipUnless(os.name == "posix", "Linux deployment paths")
+    def test_validate_root_permission_error_has_actionable_owner_advice(self):
+        with patch.object(deploy.Path, "is_symlink", side_effect=PermissionError):
+            with self.assertRaisesRegex(deploy.DeployError, "deployment owner"):
+                deploy.validate_root("/home/private-user/ci")
+
+    def test_proxy_only_storage_does_not_touch_npu_lock_or_cache_directories(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory) / "ci"
+            deploy.prepare_storage(root, proxy_only=True)
+            self.assertTrue((root / "tmp").is_dir())
+            self.assertFalse((root / "tmp/npu-locks").exists())
+            self.assertFalse((root / "cache_root").exists())
 
     def test_platforms_keep_default_runner_labels_and_add_requested_custom_labels(self):
         self.assertEqual(deploy.PLATFORMS["a5"]["labels"].split(","),
@@ -174,6 +191,141 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(calls[1][-1], "https://ghfast.top/https://github.com/example/release")
             self.assertIn("--max-time", calls[0])
 
+    def test_download_tries_direct_before_local_proxy_even_with_inherited_proxy(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            target = Path(directory) / "package.tar.gz"
+            calls = []
+            environment = {"PATH": os.environ.get("PATH", ""), "https_proxy": "http://127.0.0.1:7899",
+                           "NO_PROXY": "*", "RUNNER_TOKEN": "do-not-inherit"}
+
+            def fake_run(args, **kwargs):
+                calls.append((args, kwargs["env"]))
+                Path(args[args.index("--output") + 1]).write_bytes(b"release")
+                return subprocess.CompletedProcess(args, 1 if len(calls) == 1 else 0, "", "")
+
+            with patch.object(deploy, "run", side_effect=fake_run):
+                deploy.download("https://github.com/example/release", target, env=environment)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][0][-1], calls[1][0][-1])
+            self.assertIn("--noproxy", calls[0][0])
+            self.assertEqual(calls[0][0][calls[0][0].index("--noproxy") + 1], "*")
+            self.assertNotIn("https_proxy", calls[0][1])
+            self.assertNotIn("NO_PROXY", calls[0][1])
+            self.assertNotIn("RUNNER_TOKEN", calls[0][1])
+            self.assertEqual(calls[1][1]["https_proxy"], "http://127.0.0.1:7899")
+            self.assertEqual(calls[1][0][1], "--disable")
+
+    def test_existing_proxy_config_needs_no_subscription_and_does_not_reinstall(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory)
+            (root / "clashctl").mkdir()
+            (root / "clashctl/config-present").write_text("private")
+            with patch.object(deploy, "proxy_health", return_value=True), \
+                    patch.object(deploy, "ensure_proxy_ready") as ready, \
+                    patch.object(deploy, "secret_value") as secret, \
+                    patch.object(deploy, "download") as download:
+                deploy.ensure_proxy(deploy.argparse.Namespace(), root)
+            ready.assert_called_once_with(root)
+            secret.assert_not_called()
+            download.assert_not_called()
+
+    def test_active_proxy_is_refreshed_and_checked_without_restart(self):
+        root = Path("/home/ubuntu/ci")
+        with patch.object(deploy, "ensure_proxy_service") as service, \
+                patch.object(deploy, "install_proxy_helper") as helper, \
+                patch.object(deploy, "ensure_proxy_shell_hook"), \
+                patch.object(deploy, "service_active", return_value=True), \
+                patch.object(deploy, "systemctl", return_value=subprocess.CompletedProcess([], 0)) as systemctl, \
+                patch.object(deploy, "proxy_environment") as environment, \
+                patch.object(deploy, "proxy_connectivity", return_value=True):
+            deploy.ensure_proxy_ready(root)
+        service.assert_called_once_with(root)
+        helper.assert_called_once_with(root)
+        environment.assert_called_once_with(root)
+        systemctl.assert_called_once_with("is-enabled", deploy.PROXY_UNIT, check=False)
+
+    def test_proxy_without_github_connectivity_reports_repair_advice(self):
+        with patch.object(deploy, "ensure_proxy_service"), \
+                patch.object(deploy, "install_proxy_helper"), \
+                patch.object(deploy, "ensure_proxy_shell_hook"), \
+                patch.object(deploy, "service_active", return_value=True), \
+                patch.object(deploy, "systemctl", return_value=subprocess.CompletedProcess([], 0)), \
+                patch.object(deploy, "proxy_environment"), \
+                patch.object(deploy, "proxy_connectivity", return_value=False):
+            with self.assertRaisesRegex(deploy.DeployError, "proxycheck.*subscription/selected node"):
+                deploy.ensure_proxy_ready(Path("/home/ubuntu/ci"))
+
+    def test_proxy_service_never_overwrites_another_deployment(self):
+        unit = subprocess.CompletedProcess([], 0, "ExecStart=/other/private/bin/mihomo", "")
+        with patch.object(deploy, "systemctl", return_value=unit) as systemctl:
+            with self.assertRaisesRegex(deploy.DeployError, "another deployment"):
+                deploy.ensure_proxy_service(Path("/home/ubuntu/ci"))
+        systemctl.assert_called_once_with("cat", deploy.PROXY_UNIT, check=False)
+
+    def test_unmanaged_proxy_listener_requires_explicit_migration(self):
+        with patch.object(deploy, "systemctl", return_value=subprocess.CompletedProcess([], 1)), \
+                patch.object(deploy, "service_active", return_value=False), \
+                patch.object(deploy, "run", return_value=subprocess.CompletedProcess([], 0, "7899\n7898\n7891\n", "")), \
+                patch.object(deploy.socket, "create_connection"):
+            with self.assertRaisesRegex(deploy.DeployError, "identify its owner"):
+                deploy.ensure_proxy_service(Path("/home/ubuntu/ci"))
+
+    def test_private_existing_config_can_get_its_first_user_service_without_subscription(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            home = Path(directory)
+            root = home / "ci"
+            commands = []
+
+            def systemctl(*args, **kwargs):
+                commands.append(args)
+                return subprocess.CompletedProcess([], 1 if args[0] == "cat" else 0, "", "")
+
+            with patch.object(deploy.Path, "home", return_value=home), \
+                    patch.object(deploy, "systemctl", side_effect=systemctl), \
+                    patch.object(deploy, "service_active", return_value=False), \
+                    patch.object(deploy, "run", return_value=subprocess.CompletedProcess([], 0, "7899\n7898\n7891\n", "")), \
+                    patch.object(deploy.socket, "create_connection", side_effect=OSError):
+                deploy.ensure_proxy_service(root)
+            unit = (home / ".config/systemd/user/mihomo.service").read_text().replace("\\", "/")
+            self.assertIn(f"ExecStart={root.as_posix()}/clashctl/bin/mihomo", unit)
+            self.assertIn(f"-d {root.as_posix()}/clashctl/resources", unit)
+            self.assertIn(f"-f {root.as_posix()}/clashctl/data/runtime.yaml", unit)
+            self.assertEqual(commands, [("cat", deploy.PROXY_UNIT), ("daemon-reload",)])
+
+    def test_shell_hook_is_idempotent_preserves_user_commands_and_does_not_enable_proxy(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            home = Path(directory)
+            bashrc = home / ".bashrc"
+            bashrc.write_text("# user customization\nalias ll='ls -l'\n")
+            with patch.object(deploy.Path, "home", return_value=home):
+                deploy.ensure_proxy_shell_hook(PurePosixPath("/home/ubuntu/ci"))
+                first = bashrc.read_text()
+                deploy.ensure_proxy_shell_hook(PurePosixPath("/home/ubuntu/ci"))
+                self.assertEqual(bashrc.read_text(), first)
+                deploy.ensure_proxy_shell_hook(PurePosixPath("/home/ubuntu/new-ci"))
+            updated = bashrc.read_text()
+            self.assertIn("alias ll='ls -l'", updated)
+            self.assertEqual(updated.count("# >>> fla-npu-ci proxy >>>"), 1)
+            self.assertIn('/home/ubuntu/new-ci/vpn-proxy.sh', updated)
+            self.assertNotIn('/home/ubuntu/ci/vpn-proxy.sh', updated)
+            self.assertNotIn("proxyon;", updated)
+
+    def test_proxy_only_preflight_does_not_require_docker_npu_or_image(self):
+        with patch.object(deploy.shutil, "which", return_value="/bin/tool"), \
+                patch.object(deploy, "writable_directory", return_value=True), \
+                patch.object(deploy, "run", return_value=subprocess.CompletedProcess([], 0, "yes\n", "")) as run, \
+                patch.object(deploy, "systemctl", return_value=subprocess.CompletedProcess([], 0)), \
+                patch.object(deploy, "manager_can_access") as manager:
+            checks = deploy.preflight(Path("/home/ubuntu/ci"), "not-installed", proxy_only=True)
+        self.assertTrue(all(checks.values()))
+        self.assertNotIn("command:docker", checks)
+        self.assertNotIn("npu_devices", checks)
+        self.assertNotIn("image", checks)
+        manager.assert_not_called()
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(list(deploy.storage_layout(Path("/ci/root"), proxy_only=True)),
+                         [(Path("/ci/root"), 0o775), (Path("/ci/root/tmp"), 0o2775)])
+
     @unittest.skipUnless(os.name == "posix", "POSIX symlink validation")
     def test_download_refuses_destination_and_partial_symlinks(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
@@ -217,6 +369,117 @@ class DeployTests(unittest.TestCase):
                 tar.addfile(member)
             with self.assertRaises(deploy.DeployError):
                 deploy.extract_archive(archive, root / "target")
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "Linux Bash proxy fixture")
+class ProxyShellTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        (self.root / "clashctl/data").mkdir(parents=True)
+        self.runtime = self.root / "clashctl/data/runtime.yaml"
+        self.runtime.write_text("port: 7899\nmixed-port: 7898\nsocks-port: 7891\n")
+        self.helper = self.root / "vpn-proxy.sh"
+        shutil.copyfile(Path(deploy.__file__).with_name("vpn-proxy.sh"), self.helper)
+        self.commands = self.root / "commands.log"
+        self.bin = self.root / "fake-bin"
+        self.bin.mkdir()
+        self.tool("systemctl", r'''printf 'systemctl %s\n' "$*" >> "$FLA_TEST_COMMANDS"
+[ "$1" = --user ] && shift
+case "$1" in
+show)
+  if [ "${FLA_FAKE_UNIT_OTHER:-0}" = 1 ]; then printf '%s\n' '/other/bin/mihomo'; else printf '%s\n' "$FLA_TEST_ROOT/clashctl/bin/mihomo -f runtime.yaml"; fi ;;
+is-active) [ "${FLA_FAKE_ACTIVE:-1}" = 1 ] ;;
+start) exit 0 ;;
+*) exit 8 ;;
+esac
+''')
+        self.tool("timeout", "exit 0\n")
+        self.tool("curl", r'''printf 'curl\n' >> "$FLA_TEST_COMMANDS"
+printf '<%s>\n' "$@" >> "$FLA_TEST_COMMANDS"
+exit "${FLA_FAKE_CURL_STATUS:-0}"
+''')
+        self.tool("sudo", r'''printf 'sudo %s\n' "$*" >> "$FLA_TEST_COMMANDS"
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+''')
+        self.environment = {key: value for key, value in os.environ.items() if key not in deploy.PROXY_KEYS}
+        self.environment.update(PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                                FLA_TEST_ROOT=str(self.root), FLA_TEST_COMMANDS=str(self.commands))
+
+    def tool(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/usr/bin/env bash\n" + body)
+        path.chmod(0o755)
+
+    def shell(self, command, **environment):
+        return subprocess.run(["bash", "-ec", 'source "$1"; ' + command, "proxy-fixture", str(self.helper)],
+                              env={**self.environment, **environment}, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+
+    def test_proxyon_sets_runtime_ports_and_proxycheck_forces_real_proxy_without_restart(self):
+        result = self.shell('proxyon; proxycheck; printf "HTTP=%s SOCKS=%s\\n" "$https_proxy" "$all_proxy"; '
+                            'proxyoff; test -z "${https_proxy-}"', NO_PROXY="*", https_proxy="http://invalid:1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HTTP=http://127.0.0.1:7899 SOCKS=socks5h://127.0.0.1:7891", result.stdout)
+        commands = self.commands.read_text()
+        self.assertNotIn("start", commands)
+        self.assertNotIn("restart", commands)
+        self.assertIn("<--disable>", commands)
+        self.assertIn("<--proxy>\n<http://127.0.0.1:7899>", commands)
+        self.assertIn("<--noproxy>\n<>", commands)
+        self.assertIn("<https://github.com/>", commands)
+
+    def test_proxycheck_is_read_only_when_service_is_stopped(self):
+        result = self.shell("proxycheck", FLA_FAKE_ACTIVE="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run proxyon first", result.stderr)
+        commands = self.commands.read_text()
+        self.assertNotIn(" start ", commands)
+        self.assertNotIn("curl", commands)
+
+    def test_failed_activation_clears_stale_proxy_environment_and_does_not_start_foreign_service(self):
+        result = self.shell('if proxyon; then exit 9; fi; '
+                            'test -z "${https_proxy-}"; test -z "${HTTP_PROXY-}"; '
+                            'test -z "${ALL_PROXY-}"; test -z "${GIT_HTTP_PROXY-}"',
+                            FLA_FAKE_UNIT_OTHER="1", https_proxy="http://retained:1",
+                            HTTP_PROXY="http://retained:1", ALL_PROXY="socks5h://retained:2",
+                            GIT_HTTP_PROXY="http://retained:1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("another installation", result.stderr)
+        self.assertNotIn("start", self.commands.read_text())
+
+    def test_mixed_port_can_replace_disabled_dedicated_http_and_socks_ports(self):
+        self.runtime.write_text("port: 0\nmixed-port: 12345\nsocks-port: 0\n")
+        result = self.shell('proxyon; test "$http_proxy" = http://127.0.0.1:12345; '
+                            'test "$all_proxy" = socks5h://127.0.0.1:12345')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cross_user_caller_uses_only_the_config_owners_user_manager(self):
+        result = self.shell('_fla_proxy_owner_uid() { printf 2345; }; proxyon; proxycheck')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.commands.read_text()
+        self.assertIn("sudo -n -u #2345 -- test -r", commands)
+        self.assertIn("XDG_RUNTIME_DIR=/run/user/2345", commands)
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/2345/bus", commands)
+        self.assertNotIn("restart", commands)
+
+    def test_proxycheck_explains_https_failure(self):
+        result = self.shell("proxycheck", FLA_FAKE_CURL_STATUS="22")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("subscription and selected node", result.stderr)
+
+    def test_clashctl_invokes_official_function_as_configuration_owner(self):
+        command = self.root / "clashctl/scripts/cmd/clashctl.sh"
+        command.parent.mkdir(parents=True)
+        command.write_text('clashctl() { printf "HOME=%s\\n" "$CLASHCTL_HOME"; printf "ARG=<%s>\\n" "$@"; }\n')
+        result = self.shell('_fla_proxy_owner_uid() { printf 2345; }; clashctl status "one argument"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HOME={self.root}/clashctl", result.stdout)
+        self.assertIn("ARG=<status>\nARG=<one argument>", result.stdout)
+        self.assertIn("sudo -n -u #2345 -- env CLASHCTL_HOME=", self.commands.read_text())
 
 
 if __name__ == "__main__":

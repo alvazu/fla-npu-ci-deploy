@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "test_ci.py"
 spec = importlib.util.spec_from_file_location("local_ci", SCRIPT)
@@ -21,6 +23,8 @@ def reports():
     metadata = {"platform": "a5", "soc": "ascend950", "head_sha": "abc123", "run_id": "unique", "run_attempt": "1"}
     stages = {"schema": "npu-ci-stage-report-v1", "complete": True, "status": "success",
               "metadata": metadata, "stages": {s: {"status": "success", "exit_code": 0} for s in ci.STAGES}}
+    stages["stages"]["atk-accuracy"] = {"status": "skipped", "exit_code": None,
+                                       "reason": "no ATK operators selected"}
     cases = [{"status": "passed", "return_code": 0, "accuracy_check": True, "accuracy_status": "passed"},
              {"status": "passed", "return_code": 0, "accuracy_check": False, "accuracy_status": "not_requested"}]
     accuracy = {"schema": "gdr-accuracy-report-v1", "complete": True, "metadata": metadata,
@@ -84,6 +88,115 @@ class ReportsTest(unittest.TestCase):
     def test_credentials_redacted_from_url_artifacts(self):
         self.assertNotIn("hunter2", ci.redact("https://user:hunter2@example.com/repo?token=hunter2"))
 
+    def test_selected_atk_must_succeed(self):
+        stages, accuracy, expected = reports()
+        self.assertIn("stage did not succeed: atk-accuracy",
+                      ci.validate_reports(stages, accuracy, "all", expected, "gdn"))
+        stages["stages"]["atk-accuracy"] = {"status": "success", "exit_code": 0}
+        self.assertEqual(ci.validate_reports(stages, accuracy, "all", expected, "gdn"), [])
+        self.assertTrue(ci.validate_reports(stages, accuracy, "all", expected))
+
+    def test_unselected_atk_needs_an_explicit_reason(self):
+        stages, accuracy, expected = reports()
+        stages["stages"]["atk-accuracy"]["reason"] = "prerequisite failed"
+        self.assertTrue(ci.validate_reports(stages, accuracy, "all", expected))
+
+
+class ArgumentsAndFetchTest(unittest.TestCase):
+    def parse(self, *options):
+        return ci.validate_args(ci.parser().parse_args(["--repo", "/source", *options]))
+
+    def test_build_plan_normalizes_operators_and_requires_their_atk(self):
+        args = self.parse("--build-kind", "incremental", "--build-ops", "gdn,cp,gdn",
+                          "--atk-ops", "kda", "--device-id", "03", "--base-ref", "v0.6.0")
+        self.assertEqual((args.build_kind, args.build_ops, args.atk_ops),
+                         ("incremental", "cp,gdn", "cp,gdn,kda"))
+        self.assertEqual((args.device_id, args.base_ref), ("3", "v0.6.0"))
+
+    def test_full_mode_overrides_compilation_plan(self):
+        args = self.parse("--mode", "full", "--build-kind", "incremental", "--build-ops", "gdn")
+        self.assertEqual((args.build_kind, args.build_ops), ("full", ""))
+        self.assertEqual(args.atk_ops, "gdn")
+
+    def test_invalid_or_ambiguous_plans_are_rejected(self):
+        for options in (("--build-kind", "incremental"), ("--build-kind", "base", "--build-ops", "gdn"),
+                        ("--remote", "-origin"), ("--base-ref", "a/../b"), ("--fetch-timeout", "0")):
+            with self.subTest(options=options), self.assertRaises((ci.Failure, SystemExit)):
+                self.parse(*options)
+        with self.assertRaises(SystemExit):
+            self.parse("--ci-ref", "HEAD")
+
+    def fetch_run(self, returncodes, no_proxy=False):
+        run = object.__new__(ci.Run)
+        run.args = SimpleNamespace(remote="upstream", no_proxy=no_proxy, fetch_timeout=300)
+        run.original = Path("/source")
+        run.env = {"https_proxy": "http://inherited.invalid:9000", "HTTP_PROXY": "http://inherited.invalid:9000"}
+        run.meta = {}
+        run.say = Mock()
+        def load_proxy():
+            run.env.update({"https_proxy": "http://127.0.0.1:7890", "http_proxy": "http://127.0.0.1:7890"})
+        run.load_proxy = Mock(side_effect=load_proxy)
+        run.command = Mock(side_effect=[subprocess.CompletedProcess([], rc, b"", b"fetch failed") for rc in returncodes])
+        return run
+
+    def test_fetch_success_never_enables_proxy(self):
+        run = self.fetch_run([0])
+        run.fetch_source("upstream", "refs/pull/7/head:refs/test/7")
+        run.load_proxy.assert_not_called()
+        arguments, keywords = run.command.call_args
+        self.assertIn("http.proxy=", arguments[0])
+        self.assertIn("remote.upstream.proxy=", arguments[0])
+        self.assertNotIn("https_proxy", keywords["env"])
+        self.assertNotIn("HTTP_PROXY", keywords["env"])
+        self.assertEqual(keywords["env"]["NO_PROXY"], "*")
+        self.assertEqual(keywords["timeout"], 300)
+
+    def test_failed_direct_fetch_uses_proxy_once(self):
+        run = self.fetch_run([1, 0])
+        run.fetch_source("upstream", "refs/pull/7/head:refs/test/7")
+        run.load_proxy.assert_called_once()
+        self.assertEqual(run.meta["source_fetch_attempts"], [
+            {"transport": "direct", "exit_code": 1}, {"transport": "proxy", "exit_code": 0}])
+        arguments, keywords = run.command.call_args
+        self.assertIn("http.proxy=http://127.0.0.1:7890", arguments[0])
+        self.assertEqual(keywords["env"]["https_proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(keywords["timeout"], 300)
+
+    def test_direct_timeout_is_recorded_and_retried_through_proxy(self):
+        run = self.fetch_run([])
+        run.command.side_effect = [subprocess.TimeoutExpired(["git", "fetch"], 300),
+                                   subprocess.CompletedProcess([], 0, b"", b"")]
+        run.fetch_source("upstream", "HEAD")
+        run.load_proxy.assert_called_once()
+        self.assertEqual(run.meta["source_fetch_attempts"], [
+            {"transport": "direct", "exit_code": 124, "timed_out": True, "timeout_seconds": 300},
+            {"transport": "proxy", "exit_code": 0}])
+
+    def test_proxy_timeout_fails_with_bounded_diagnostic(self):
+        run = self.fetch_run([])
+        run.command.side_effect = [subprocess.CompletedProcess([], 1, b"", b"failed"),
+                                   subprocess.TimeoutExpired(["git", "fetch"], 300)]
+        with self.assertRaisesRegex(ci.Failure, "proxy Git fetch timed out after 300 seconds"):
+            run.fetch_source("upstream", "HEAD")
+        self.assertEqual(run.meta["source_fetch_attempts"][-1]["exit_code"], 124)
+
+    def test_real_child_process_timeout_is_recorded(self):
+        run = object.__new__(ci.Run)
+        run.env, run.commands = dict(os.environ), []
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run.command([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.05)
+        self.assertTrue(run.commands[0]["timed_out"])
+        self.assertEqual(run.commands[0]["exit_code"], 124)
+
+    def test_proxy_failure_and_disabled_proxy_fail_explicitly(self):
+        run = self.fetch_run([1, 1])
+        with self.assertRaisesRegex(ci.Failure, "Git fetch failed through proxyon"):
+            run.fetch_source("upstream", "HEAD")
+        run = self.fetch_run([1], no_proxy=True)
+        with self.assertRaisesRegex(ci.Failure, "--no-proxy disabled retry"):
+            run.fetch_source("upstream", "HEAD")
+        run.load_proxy.assert_not_called()
+
 
 @unittest.skipUnless(platform.system() == "Linux" and hasattr(os, "getuid") and os.getuid() != 0
                      and shutil.which("git") and shutil.which("bash"), "CLI fixture runs on a non-root Linux host")
@@ -95,22 +208,34 @@ class CliFixtureTest(unittest.TestCase):
         self.repo = self.root / "source with spaces"
         self.repo.mkdir()
         self.ci_root = self.root / "ci storage"
+        self.ci_root.mkdir()
+        (self.ci_root / "vpn-proxy.sh").write_text(
+            "proxyon() { export http_proxy=http://fixture-proxy.invalid:7890; "
+            "export https_proxy=$http_proxy HTTP_PROXY=$http_proxy HTTPS_PROXY=$http_proxy; }\n")
         self.tools = self.root / "tools"
         self.tools.mkdir()
         self.outside = self.root / "outside cwd"
         self.outside.mkdir()
-        for folder in ("ci", "cmake/scripts"):
+        for folder in ("ci", "cmake/scripts", "tests/atk"):
             (self.repo / folder).mkdir(parents=True)
         (self.repo / "ci/run_checks.sh").write_text(
-            "export CMAKE_BUILD_PARALLEL_LEVEL=16\nexport MAX_JOBS=16\nexport FLA_NPU_BUILD_ARGS=-j16\n")
+            "CI_BUILD_KIND=full\n# stage: atk-accuracy\n")
+        (self.repo / "ci/prepare_ci_package.sh").write_text("#!/bin/bash\nexit 0\n")
+        (self.repo / "tests/atk/run_test_cpu.sh").write_text("#!/bin/bash\nexit 0\n")
         (self.repo / "cmake/scripts/prepare.sh").write_text('CPU_NUM=${CMAKE_BUILD_PARALLEL_LEVEL:-8}\n')
         (self.repo / "ci/run_ci_container.sh").write_text("#!/bin/bash\nexec python3 ci/fixture.py\n")
         fixture = '''import json, os, pathlib, sys
-stages = ("environment-contracts", "opp-package", "standalone-layout", "torch-adapter", "gdr-example-st", "scoped-overlay")
+stages = ("environment-contracts", "opp-package", "standalone-layout", "torch-adapter", "gdr-example-st", "atk-accuracy")
 e = os.environ
+expected_proxy = e.get("FIXTURE_EXPECT_PROXY", "http://fixture-proxy.invalid:7890")
+assert e.get("https_proxy", "") == expected_proxy, "CI did not receive the selected proxy"
+if not expected_proxy:
+    assert not any(e.get(key) for key in ("http_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")), "--no-proxy leaked an inherited proxy"
 meta = {k: e[v] for k,v in {"platform":"CI_ACCURACY_PLATFORM", "soc":"CI_SOC", "head_sha":"CI_ACCURACY_HEAD_SHA", "run_id":"CI_ACCURACY_RUN_ID", "run_attempt":"CI_ACCURACY_RUN_ATTEMPT"}.items()}
 n = len(stages) if e["CI_STAGE"] == "all" else stages.index(e["CI_STAGE"]) + 1
 report = {"schema":"npu-ci-stage-report-v1", "complete":True,"status":"success","metadata":meta,"stages":{s:{"status":"success" if i<n else "skipped","exit_code":0 if i<n else None} for i,s in enumerate(stages)}}
+if n == len(stages) and not e.get("CI_ATK_OPS"):
+    report["stages"]["atk-accuracy"] = {"status":"skipped","exit_code":None,"reason":"no ATK operators selected"}
 # Emulate the container's existing /tmp bind mount without starting Docker.
 path = pathlib.Path(e["CI_HOST_TMPDIR"]) / "reports"
 path.mkdir(exist_ok=True)
@@ -164,6 +289,54 @@ exit 0
         self.assertEqual(e["environment"]["CI_JOBS"], "16")
         self.assertEqual(e["environment"]["CI_REQUIRE_HEALTHY_NPU"], "false")
         self.assertEqual(e["environment"]["CI_STAGE_REPORT_FILE"], "/tmp/fla-npu-ci/reports/stages.json")
+        self.assertEqual(e["environment"]["CI_BUILD_KIND"], "full")
+        self.assertNotIn("CI_RUN_SCOPED_WHEEL_INSTALL_CHECK", e["environment"])
+
+    def test_incremental_plan_and_atk_are_forwarded(self):
+        p, e, _ = self.invoke("--build-kind", "incremental", "--build-ops", "gdn", "--atk-ops", "kda",
+                              "--device-id", "2", "--base-ref", "v0.6.0")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(e["environment"]["CI_BUILD_KIND"], "incremental")
+        self.assertEqual(e["environment"]["CI_BUILD_OPS"], "gdn")
+        self.assertEqual(e["environment"]["CI_ATK_OPS"], "gdn,kda")
+        self.assertEqual(e["environment"]["CI_DEVICE_ID"], "2")
+        self.assertEqual(e["environment"]["CI_BASE_REF"], "v0.6.0")
+
+    def test_prepare_only_fetches_pr_without_docker_or_npu(self):
+        self.git("update-ref", "refs/pull/7/head", "HEAD")
+        p, e, _ = self.invoke("--pr", "7", "--remote", str(self.repo), "--prepare-only")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(e["status"], "success")
+        self.assertFalse(e["full_ci_passed"])
+        self.assertFalse(e["unmodified_commit_test"])
+        self.assertTrue(e["source_preparation_only"])
+        self.assertTrue(e["cleanup"]["isolated_worktree_removed"])
+        self.assertEqual(e["source_fetch_attempts"], [{"transport": "direct", "exit_code": 0}])
+        self.assertEqual(e["proxy"]["source"], "deferred until a direct fetch fails")
+        self.assertFalse(any(item["argv"][0] in ("docker", "npu-smi") for item in e["commands"]))
+
+    def test_direct_pr_fetch_still_loads_proxy_before_ci(self):
+        self.git("update-ref", "refs/pull/7/head", "HEAD")
+        p, e, _ = self.invoke("--pr", "7", "--remote", str(self.repo))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(e["source_fetch_attempts"], [{"transport": "direct", "exit_code": 0}])
+        self.assertEqual(e["proxy"]["source"], "script")
+
+    def test_ref_loads_explicit_proxy_for_dependency_downloads(self):
+        proxy = self.root / "custom proxy.sh"
+        proxy.write_text("proxyon() { export http_proxy=http://explicit.invalid:7891; "
+                         "export https_proxy=$http_proxy; }\n")
+        p, e, _ = self.invoke("--ref", "HEAD", "--proxy-script", str(proxy),
+                              FIXTURE_EXPECT_PROXY="http://explicit.invalid:7891")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("source_fetch_attempts", e)
+        self.assertEqual(e["proxy"]["script"], str(proxy))
+
+    def test_no_proxy_clears_inherited_values_before_ci(self):
+        p, e, _ = self.invoke("--no-proxy", FIXTURE_EXPECT_PROXY="",
+                              https_proxy="http://inherited.invalid:8000", HTTP_PROXY="http://inherited.invalid:8000")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(e["proxy"]["source"], "disabled")
 
     def test_nonzero_ci_cannot_be_overruled_by_success_reports(self):
         p, e, _ = self.invoke(FIXTURE_EXIT="7")

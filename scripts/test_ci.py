@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -16,11 +15,11 @@ import shutil
 import signal
 import subprocess
 import sys
-import tarfile
 import uuid
 
 STAGES = ("environment-contracts", "opp-package", "standalone-layout",
-          "torch-adapter", "gdr-example-st", "scoped-overlay")
+          "torch-adapter", "gdr-example-st", "atk-accuracy")
+BUILD_KINDS = ("full", "incremental", "torch", "base")
 PLATFORMS = {"a2": ("ascend910b", "fla-npu-ci:9.1.0-910b", "ci/Dockerfile"),
              "a5": ("ascend950", "fla-npu-ci:9.1.0-950", "ci/Dockerfile.ascend950")}
 PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
@@ -61,7 +60,7 @@ def write_json(path, data):
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def validate_reports(stage_report, accuracy_report, requested, expected):
+def validate_reports(stage_report, accuracy_report, requested, expected, atk_ops=""):
     """Validate provenance and the selected stage prefix, rather than exit code alone."""
     errors = []
     count = len(STAGES) if requested == "all" else STAGES.index(requested) + 1
@@ -81,6 +80,10 @@ def validate_reports(stage_report, accuracy_report, requested, expected):
     for name in STAGES[:count]:
         entry = stages.get(name, {})
         entry = entry if isinstance(entry, dict) else {}
+        if name == "atk-accuracy" and not atk_ops:
+            if entry.get("status") != "skipped" or entry.get("reason") != "no ATK operators selected":
+                errors.append("ATK without selected operators must report the documented skip reason")
+            continue
         if entry.get("status") != "success" or entry.get("exit_code") != 0:
             errors.append("stage did not succeed: " + name)
     # CI_STAGE selects a prefix. Later stages must not accidentally be reported as tested.
@@ -142,6 +145,8 @@ class Run:
         # Deployment credentials are unrelated to source validation.
         for key in ("RUNNER_TOKEN", "FLA_CI_SUBSCRIPTION_URL"):
             self.env.pop(key, None)
+        if args.no_proxy:
+            self.env = {key: value for key, value in self.env.items() if key not in PROXY_KEYS}
         self.errors = []
         self.repo = None
         self.original = None
@@ -156,23 +161,48 @@ class Run:
         self.meta = {"schema": "fla-local-ci-evidence-v1", "run_id": self.run_id,
                      "started_at": now(), "status": "failure", "full_ci_passed": False,
                      "requested_stage": args.stage, "mode": args.mode,
+                     "source_preparation_only": args.prepare_only,
+                     "build_plan": {"kind": args.build_kind, "operators": args.build_ops,
+                                    "atk_operators": args.atk_ops, "base_ref": args.base_ref,
+                                    "device_id": args.device_id},
                      "platform": args.platform, "soc": PLATFORMS[args.platform][0],
                      "host_arch": platform.machine(), "host_user_uid": os.getuid(),
                      "result_directory": str(self.result), "container_name": self.container,
                      "ci_exit_code": None, "errors": self.errors, "commands": self.commands}
         self.meta["verifier"] = {"script_sha256": digest(__file__), "python": sys.version.split()[0]}
+        self.meta["proxy"] = {"source": "disabled" if args.no_proxy else "deferred until a direct fetch fails"}
 
     def say(self, text):
         text = redact(text)
         print(text, flush=True)
         self.log.write(text + "\n")
 
-    def command(self, argv, cwd=None, check=True, binary=False, env=None):
+    def command(self, argv, cwd=None, check=True, binary=False, env=None, timeout=None):
         argv = [str(x) for x in argv]
         item = {"argv": [redact(x) for x in argv], "cwd": str(cwd or Path.cwd())}
         self.commands.append(item)
-        p = subprocess.run(argv, cwd=cwd, env=self.env if env is None else env,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        options = {"cwd": cwd, "env": self.env if env is None else env,
+                   "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        if timeout is None:
+            p = subprocess.run(argv, **options)
+        else:
+            # A fetch can spawn git-remote-https. Kill its process group on a
+            # timeout so an orphan cannot keep pipes or repository locks open.
+            with subprocess.Popen(argv, start_new_session=os.name == "posix", **options) as child:
+                try:
+                    stdout, stderr = child.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired as exc:
+                    if os.name == "posix":
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        child.kill()
+                    exc.output, exc.stderr = child.communicate()
+                    item.update({"exit_code": 124, "timed_out": True, "timeout_seconds": timeout})
+                    raise
+                p = subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
         item["exit_code"] = p.returncode
         if check and p.returncode:
             raise Failure("command failed: " + shlex.join(argv) + "\n" + redact(p.stderr.decode(errors="replace")))
@@ -186,10 +216,8 @@ class Run:
             return
         path = Path(self.args.proxy_script).expanduser().resolve() if self.args.proxy_script else self.root / "vpn-proxy.sh"
         if not path.is_file():
-            if self.args.proxy_script:
-                raise Failure("explicit proxy script does not exist: " + str(path))
-            self.meta["proxy"] = {"source": "inherited" if any(self.env.get(k) for k in PROXY_KEYS[:6]) else "none"}
-            return
+            raise Failure("proxy script is missing: " + str(path) +
+                          "; deploy clashctl/proxyon or pass --proxy-script")
         code = "import json,os; print(json.dumps({k:os.environ.get(k,'') for k in " + repr(PROXY_KEYS) + "}))"
         shell = 'set -euo pipefail; source "$1" >/dev/null; proxyon >/dev/null; "$2" -c "$3"'
         raw = self.command(["bash", "-c", shell, "local-ci-proxy", path, sys.executable, code])
@@ -203,8 +231,53 @@ class Run:
             if not isinstance(value, str) or any(c in value for c in ("\r", "\n", "\x00")):
                 raise Failure("proxy variable contains an invalid value: " + key)
             self.env[key] = value
+        if not (values.get("https_proxy") or values.get("http_proxy")):
+            raise Failure("proxyon did not export an HTTP(S) proxy; repair vpn-proxy.sh or use --no-proxy")
         self.meta["proxy"] = {"source": "script", "script": str(path), "script_sha256": digest(path),
                               "exported_variables": sorted(k for k, v in values.items() if v)}
+
+    def fetch_source(self, *arguments):
+        """Every source fetch starts without inherited or configured Git proxies."""
+        def attempt(argv, env, transport):
+            record = {"transport": transport}
+            try:
+                result = self.command(argv, env=env, check=False, binary=True, timeout=self.args.fetch_timeout)
+            except subprocess.TimeoutExpired:
+                message = "%s Git fetch timed out after %s seconds" % (transport, self.args.fetch_timeout)
+                self.say("[local-ci] " + message)
+                record.update({"timed_out": True, "timeout_seconds": self.args.fetch_timeout})
+                result = subprocess.CompletedProcess(argv, 124, b"", message.encode("utf-8"))
+            record["exit_code"] = result.returncode
+            self.meta.setdefault("source_fetch_attempts", []).append(record)
+            return result
+
+        direct_env = {key: value for key, value in self.env.items() if key not in PROXY_KEYS}
+        direct_env.update({"no_proxy": "*", "NO_PROXY": "*", "GIT_TERMINAL_PROMPT": "0"})
+        configs = ["-c", "http.proxy=", "-c", "https.proxy=", "-c", "core.gitProxy="]
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", self.args.remote):
+            configs += ["-c", "remote." + self.args.remote + ".proxy="]
+        command = ["git", "-C", self.original, *configs, "fetch", "--no-tags", "--", *arguments]
+        self.say("[local-ci] fetching source directly (proxy disabled)")
+        result = attempt(command, direct_env, "direct")
+        if not result.returncode:
+            return
+        if self.args.no_proxy:
+            raise Failure("direct Git fetch failed and --no-proxy disabled retry: " +
+                          redact(result.stderr.decode(errors="replace")))
+        self.say("[local-ci] direct Git fetch failed; enabling proxyon and retrying")
+        self.load_proxy()
+        proxy_env = dict(self.env, GIT_TERMINAL_PROMPT="0")
+        proxy_url = self.env.get("https_proxy") or self.env.get("http_proxy")
+        if not proxy_url:
+            raise Failure("proxyon did not export an HTTP(S) proxy; repair vpn-proxy.sh")
+        retry_configs = ["-c", "http.proxy=" + proxy_url, "-c", "https.proxy=" + proxy_url]
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", self.args.remote):
+            retry_configs += ["-c", "remote." + self.args.remote + ".proxy=" + proxy_url]
+        retry = attempt(["git", "-C", self.original, *retry_configs,
+                         "fetch", "--no-tags", "--", *arguments], proxy_env, "proxy")
+        if retry.returncode:
+            raise Failure("Git fetch failed through proxyon after the direct attempt; check proxy health, "
+                          "remote access and the PR number: " + redact(retry.stderr.decode(errors="replace")))
 
     def git(self, *argv, **kwargs):
         return self.command(["git", "-C", self.original, *argv], **kwargs)
@@ -253,18 +326,16 @@ class Run:
             raise Failure("--repo must name the Git repository root")
         if self.root == top or top in self.root.parents:
             raise Failure("--ci-root must be outside the source repository")
-        if top.stat().st_uid != os.getuid():
+        if top.stat().st_uid != os.getuid() and not self.args.prepare_only:
             raise Failure("the source directory must belong to the invoking non-root user")
         self.meta["input_source"] = self.snapshot(self.original, "input-source")
-        needs_worktree = bool(self.args.pr or self.args.ref or self.args.ci_ref)
-        if self.args.ci_ref and not (self.args.pr or self.args.ref) and self.meta["input_source"]["dirty"]:
-            raise Failure("--ci-ref with a dirty source needs an explicit --ref/--pr; dirty changes would be omitted")
+        needs_worktree = bool(self.args.pr or self.args.ref)
         if needs_worktree:
             target = self.args.ref or "HEAD"
             if self.args.pr:
                 self.fetch_ref = "refs/fla-local-ci/" + self.run_id
-                self.git("fetch", "--no-tags", self.args.remote,
-                         "refs/pull/%d/head:%s" % (self.args.pr, self.fetch_ref))
+                self.fetch_source(self.args.remote,
+                                  "refs/pull/%d/head:%s" % (self.args.pr, self.fetch_ref))
                 target = self.fetch_ref
             sha = self.git("rev-parse", target + "^{commit}")
             self.worktree = self.root / "tmp" / ("source-" + self.run_id)
@@ -276,41 +347,18 @@ class Run:
             self.repo = self.original
             self.meta["selection"] = {"kind": "existing checkout, including its local changes"}
         self.source_lock_file()
-        if self.args.ci_ref:
-            ci_sha = self.git("rev-parse", self.args.ci_ref + "^{commit}")
-            # Extract only these explicitly documented paths; leave source/index untouched.
-            archive = self.git("archive", ci_sha, "ci", "cmake/scripts/prepare.sh", binary=True).stdout
-            with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-                members = tar.getmembers()
-                for member in members:
-                    path = Path(member.name)
-                    if (path.is_absolute() or ".." in path.parts or not (member.isfile() or member.isdir())
-                            or self.repo not in (self.repo / path).resolve().parents):
-                        raise Failure("unsafe CI overlay archive member: " + member.name)
-                for child in (self.repo / "ci").rglob("*"):
-                    if child.is_symlink():
-                        raise Failure("refusing CI overlay over source symlinks")
-                if (self.repo / "ci").exists():
-                    shutil.rmtree(self.repo / "ci")
-                for member in members:
-                    path = self.repo / member.name
-                    if member.isdir():
-                        path.mkdir(parents=True, exist_ok=True)
-                    else:
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(tar.extractfile(member).read())
-                        path.chmod(member.mode & 0o777)
-            self.meta["ci_override"] = {"ref": self.args.ci_ref, "sha": ci_sha,
-                                       "paths": ["ci/", "cmake/scripts/prepare.sh"],
-                                       "note": "explicit CI overlay; evidence does not describe the unmodified target commit"}
         self.meta["tested_source"] = self.snapshot(self.repo, "tested-source")
-        if not (self.repo / "ci/run_ci_container.sh").is_file():
-            raise Failure("source is missing ci/run_ci_container.sh")
+        required = ("ci/run_ci_container.sh", "ci/run_checks.sh", "ci/prepare_ci_package.sh")
+        for path in required:
+            if not (self.repo / path).is_file():
+                raise Failure("selected source is missing " + path +
+                              "; use a revision containing the CI changes from PR #1041")
         checks = (self.repo / "ci/run_checks.sh").read_text()
-        prepare = (self.repo / "cmake/scripts/prepare.sh").read_text()
-        required = ("export CMAKE_BUILD_PARALLEL_LEVEL=", "export MAX_JOBS=", "export FLA_NPU_BUILD_ARGS=")
-        if any(item not in checks for item in required) or "${CMAKE_BUILD_PARALLEL_LEVEL:-" not in prepare:
-            raise Failure("source CI does not enforce nested -j16 builds; use PR #973 or --ci-ref <trusted-ref> (explicit isolated CI overlay)")
+        if "CI_BUILD_KIND" not in checks or "atk-accuracy" not in checks:
+            raise Failure("selected source does not support the build-plan/ATK CI pipeline; "
+                          "use a revision containing PR #1041; CI always comes from the selected source")
+        if self.args.atk_ops and not (self.repo / "tests/atk/run_test_cpu.sh").is_file():
+            raise Failure("selected source is missing the ATK entry tests/atk/run_test_cpu.sh")
 
     def source_lock_file(self):
         import fcntl
@@ -333,6 +381,9 @@ class Run:
         self.command(command)
 
     def run_ci(self):
+        # Source retrieval tries direct access first. Package/dependency downloads
+        # inside the real CI need the deployed proxy even if no fetch failed.
+        self.load_proxy()
         for tool in ("git", "docker", "bash", "flock", "npu-smi"):
             if shutil.which(tool) is None:
                 raise Failure("required host executable is missing: " + tool)
@@ -358,6 +409,9 @@ class Run:
         self.report_dir = report_dir
         soc = PLATFORMS[self.args.platform][0]
         controlled = {"CI_MODE": self.args.mode, "CI_STAGE": self.args.stage, "CI_SOC": soc, "FLA_NPU_SOC": soc,
+                      "CI_BUILD_KIND": self.args.build_kind, "CI_BUILD_OPS": self.args.build_ops,
+                      "CI_ATK_OPS": self.args.atk_ops, "CI_BASE_REF": self.args.base_ref,
+                      "CI_DEVICE_ID": self.args.device_id,
                       "CI_IMAGE": self.args.image, "CI_DOCKERFILE": self.args.dockerfile,
                       "CI_REQUIRE_PRELOADED_IMAGE": "false" if self.args.build_image else "true",
                       "CI_JOBS": "16", "CI_CPACK_JOBS": "16", "CMAKE_BUILD_PARALLEL_LEVEL": "16",
@@ -367,7 +421,7 @@ class Run:
                       "CI_CACHE_ROOT": str(self.root / "cache_root"),
                       "CI_NPU_LOCK_DIR": str(self.root / "tmp" / "npu-locks"),
                       "CI_RUN_STANDALONE_WHEEL_LAYOUT_CHECK": "true",
-                      "CI_RUN_SCOPED_WHEEL_INSTALL_CHECK": "true", "CI_RUN_EXAMPLE_ST": "true",
+                      "CI_RUN_EXAMPLE_ST": "true",
                       "CI_REQUIRE_HEALTHY_NPU": str(self.args.require_healthy_npu).lower(),
                       "CI_LOG_CLEANUP_ENABLED": "false",
                       "CI_STAGE_REPORT_FILE": "/tmp/fla-npu-ci/reports/stages.json",
@@ -440,11 +494,21 @@ class Run:
             expected = {"platform": self.args.platform, "soc": PLATFORMS[self.args.platform][0],
                         "head_sha": self.meta["tested_source"]["head_sha"], "run_id": self.run_id,
                         "run_attempt": "1"}
-            self.errors.extend(validate_reports(reports.get("stages"), reports.get("accuracy"), self.args.stage, expected))
+            self.errors.extend(validate_reports(reports.get("stages"), reports.get("accuracy"), self.args.stage,
+                                                expected, self.args.atk_ops))
             stages = reports.get("stages")
             accuracy = reports.get("accuracy")
             self.meta["stage_results"] = stages.get("stages", {}) if isinstance(stages, dict) else {}
             self.meta["case_summary"] = accuracy.get("summary") if isinstance(accuracy, dict) else None
+            atk_results = self.repo / ".ci-tmp" / "atk-results"
+            if atk_results.is_dir():
+                try:
+                    if atk_results.is_symlink() or any(path.is_symlink() for path in atk_results.rglob("*")):
+                        raise Failure("ATK result directory contains a symlink")
+                    shutil.copytree(atk_results, self.result / "atk-results")
+                    self.meta["atk_results"] = "atk-results"
+                except (OSError, Failure) as exc:
+                    self.errors.append("ATK artifact capture failed: " + str(exc))
         for path in (self.host_tmp, self.host_scratch):
             try:
                 if path.exists():
@@ -485,9 +549,9 @@ class Run:
         self.meta["finished_at"] = now()
         if not self.errors and self.meta["ci_exit_code"] == 0:
             self.meta["status"] = "success"
-            self.meta["full_ci_passed"] = self.args.stage == "all"
+            self.meta["full_ci_passed"] = self.args.stage == "all" and not self.args.prepare_only
         tested = self.meta.get("tested_source", {})
-        self.meta["unmodified_commit_test"] = bool(tested and not tested.get("dirty") and not self.args.ci_ref
+        self.meta["unmodified_commit_test"] = bool(tested and not tested.get("dirty") and not self.args.prepare_only
                                                   and self.meta.get("source_changed_during_run") is False)
         self.say("[local-ci] " + self.meta["status"] + "; evidence: " + str(self.result))
         write_json(self.result / "evidence.json", self.meta)
@@ -498,22 +562,43 @@ class Run:
                  "- Unmodified commit tested: " + str(self.meta["unmodified_commit_test"]),
                  "- Platform / SOC: " + self.args.platform + " / " + PLATFORMS[self.args.platform][0],
                  "- Requested stage / mode: " + self.args.stage + " / " + self.args.mode,
+                 "- Source preparation only: " + str(self.args.prepare_only),
+                 "- Build / build operators / ATK operators: " + self.args.build_kind + " / " +
+                    (self.args.build_ops or "none") + " / " + (self.args.atk_ops or "none"),
+                 "- Base package branch / requested physical NPU: " + self.args.base_ref + " / " +
+                    (self.args.device_id or "automatic"),
                  "- Require healthy NPU: " + str(self.args.require_healthy_npu),
                  "- Selected NPU health: " + self.meta.get("selected_npu", {}).get("health", "not selected; see ci.log / host npu-smi evidence"),
                  "- CI exit code: " + str(self.meta["ci_exit_code"]), "",
                  "A local result records this machine, image, configuration and source snapshot. "
-                 "A partial stage run or dirty/overlaid source is not proof that the unmodified PR passed full CI.", ""]
-        if self.args.ci_ref:
-            lines += ["Explicit CI overlay: `" + self.args.ci_ref + "`; see evidence.json and tested-source.patch.", ""]
+                 "A source preparation, partial stage run or dirty source is not proof that the unmodified PR passed full CI.", ""]
         if self.errors:
             lines += ["Failures:", ""] + ["- " + redact(e).replace("\n", " ") for e in self.errors] + [""]
         lines += ["Artifacts: `ci.log`, `runner.log`, `stages.json`, `accuracy.json` (when required), "
                   "`build-environment.json`, source patches/untracked hashes, `evidence.json`, `SHA256SUMS`."]
         (self.result / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.log.close()
-        sums = [digest(p) + "  " + p.name for p in sorted(self.result.iterdir()) if p.is_file() and p.name != "SHA256SUMS"]
+        sums = [digest(p) + "  " + p.relative_to(self.result).as_posix()
+                for p in sorted(self.result.rglob("*")) if p.is_file() and p.name != "SHA256SUMS"]
         (self.result / "SHA256SUMS").write_text("\n".join(sums) + "\n", encoding="utf-8")
         return 0 if self.meta["status"] == "success" else (self.meta["ci_exit_code"] or 1)
+
+
+def operator_list(value):
+    if not value:
+        return ""
+    values = value.split(",")
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", item.strip()) for item in values):
+        raise argparse.ArgumentTypeError("operators must be comma-separated names (letters, digits, _, ., -)")
+    return ",".join(sorted(set(item.strip() for item in values)))
+
+
+def device_id(value):
+    if not value:
+        return ""
+    if not re.fullmatch(r"[0-9]+", value):
+        raise argparse.ArgumentTypeError("device ID must be a nonnegative physical NPU ID")
+    return str(int(value))
 
 
 def parser():
@@ -523,31 +608,61 @@ def parser():
     p.add_argument("--ci-root", default="/home/huangjunzhe/ci")
     p.add_argument("--stage", choices=("all",) + STAGES, default="all", help="CI prefix ending at this stage")
     p.add_argument("--mode", choices=("quick", "full"), default="quick")
+    p.add_argument("--build-kind", choices=BUILD_KINDS, default="full",
+                   help="explicit package plan; full mode always forces a full build")
+    p.add_argument("--build-ops", type=operator_list, default="", help="comma-separated incremental build operators")
+    p.add_argument("--atk-ops", type=operator_list, default="", help="comma-separated ATK accuracy operators")
+    p.add_argument("--device-id", type=device_id, default="", help="physical NPU ID; omitted means automatic selection")
+    p.add_argument("--base-ref", default="main", help="Daily base package branch, such as main or v0.6.0")
+    p.add_argument("--prepare-only", action="store_true", help="prepare source and retain evidence without Docker/NPU work")
     p.add_argument("--image")
     p.add_argument("--dockerfile")
     p.add_argument("--build-image", action="store_true", help="allow CI to build the image if missing")
     p.add_argument("--require-healthy-npu", action="store_true",
                    help="reject a selected NPU unless health=OK; default follows upstream CI (false)")
     proxy = p.add_mutually_exclusive_group()
-    proxy.add_argument("--proxy-script", help="source this script and call proxyon; default: <ci-root>/vpn-proxy.sh if present")
-    proxy.add_argument("--no-proxy", action="store_true", help="disable auto proxy loading and remove inherited proxy variables")
+    proxy.add_argument("--proxy-script", help="proxyon script for failed direct fetches and CI dependency downloads; default: <ci-root>/vpn-proxy.sh")
+    proxy.add_argument("--no-proxy", action="store_true", help="disable fetch retry and remove inherited proxy variables")
     selection = p.add_mutually_exclusive_group()
     selection.add_argument("--pr", type=int, help="fetch PR head from --remote into an isolated worktree")
     selection.add_argument("--ref", help="existing Git ref to test in an isolated detached worktree")
     p.add_argument("--remote", default="upstream")
+    p.add_argument("--fetch-timeout", type=int, default=300,
+                   help="timeout in seconds per direct/proxy Git fetch attempt (default: 300); CI builds are unaffected")
     p.add_argument("--base", help="existing comparison ref; record its SHA and merge-base (does not merge)")
-    p.add_argument("--ci-ref", help="explicitly overlay ci/ and cmake/scripts/prepare.sh from this trusted ref; always isolated")
     return p
 
 
+def validate_args(args):
+    build_atk_ops = args.build_ops
+    if args.pr is not None and args.pr < 1:
+        raise Failure("--pr must be positive")
+    if args.fetch_timeout <= 0:
+        raise Failure("--fetch-timeout must be positive")
+    if args.mode == "full":
+        args.build_kind, args.build_ops = "full", ""
+    elif args.build_kind == "incremental" and not args.build_ops:
+        raise Failure("--build-kind incremental requires --build-ops")
+    elif args.build_kind != "incremental" and args.build_ops:
+        raise Failure("--build-ops is only valid with --build-kind incremental")
+    # A rebuilt operator always needs ATK accuracy, just as in the GitHub plan.
+    args.atk_ops = operator_list(",".join(filter(None, (args.atk_ops, build_atk_ops))))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", args.base_ref) or ".." in args.base_ref:
+        raise Failure("--base-ref must be a branch name without whitespace or '..'")
+    if not args.remote or args.remote.startswith("-") or any(c in args.remote for c in ("\r", "\n", "\x00")):
+        raise Failure("--remote must be a Git remote name or URL")
+    return args
+
+
 def main(argv=None):
-    args = parser().parse_args(argv)
+    try:
+        args = validate_args(parser().parse_args(argv))
+    except Failure as exc:
+        parser().error(str(exc))
     if os.name != "posix" or platform.system() != "Linux":
         parser().error("run this script on the Linux NPU host")
-    if os.getuid() == 0:
+    if os.getuid() == 0 and not args.prepare_only:
         parser().error("run as the CI user (for example ubuntu), without sudo")
-    if args.pr is not None and args.pr < 1:
-        parser().error("--pr must be positive")
     args.image = args.image or PLATFORMS[args.platform][1]
     args.dockerfile = args.dockerfile or PLATFORMS[args.platform][2]
     os.umask(0o077)
@@ -561,9 +676,12 @@ def main(argv=None):
     for sig in (signal.SIGINT, signal.SIGTERM):
         old_handlers[sig] = signal.signal(sig, interrupted)
     try:
-        run.load_proxy()
         run.prepare_source()
-        run.run_ci()
+        if args.prepare_only:
+            run.meta["ci_exit_code"] = 0
+            run.say("[local-ci] source prepared; Docker/NPU execution was not requested")
+        else:
+            run.run_ci()
     except KeyboardInterrupt as exc:
         run.meta["ci_exit_code"] = 130
         run.errors.append("interrupted: " + str(exc))

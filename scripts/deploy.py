@@ -26,6 +26,8 @@ CLASHCTL_REV = "e38d643725594c38c3fb02f355a2c89eba9c296c"
 CLASHCTL_SHA256 = "172e68840d6b81e454950f90e81439fc0ca424e589b1f2f5de36aa9a39d12fef"
 RUNNER_UNIT = "fla-npu-runner.service"
 PROXY_UNIT = "mihomo.service"
+PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+              "no_proxy", "NO_PROXY", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY")
 PLATFORMS = {
     "a5": {"arch": "x64", "machine": "x86_64", "image": "fla-npu-ci:9.1.0-950",
            "sha256": "af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32",
@@ -79,8 +81,11 @@ def validate_root(value):
     if (".." in path.parts or path in protected or path.parent == Path("/")
             or path.parent == Path("/home")):
         raise DeployError("Refusing an unsafe CI root")
-    if path.is_symlink():
-        raise DeployError("CI root must not be a symlink")
+    try:
+        if path.is_symlink():
+            raise DeployError("CI root must not be a symlink")
+    except OSError:
+        raise DeployError("Cannot access CI root; run as its deployment owner or choose an accessible --ci-root") from None
     return path
 
 
@@ -138,14 +143,16 @@ def writable_directory(path):
     return path.is_dir() and not path.is_symlink() and os.access(path, os.R_OK | os.W_OK | os.X_OK)
 
 
-def storage_layout(root):
-    return ((root, 0o775), (root / "tmp", 0o2775), (root / "cache_root", 0o2775),
-            (root / "tmp/npu-locks", 0o2775))
+def storage_layout(root, *, proxy_only=False):
+    directories = ((root, 0o775), (root / "tmp", 0o2775))
+    if proxy_only:
+        return directories
+    return (*directories, (root / "cache_root", 0o2775), (root / "tmp/npu-locks", 0o2775))
 
 
-def prepare_storage(root):
+def prepare_storage(root, *, proxy_only=False):
     """Create persistent CI directories once; preserve existing directory ownership/modes."""
-    for directory, mode in storage_layout(root):
+    for directory, mode in storage_layout(root, proxy_only=proxy_only):
         if directory.is_symlink():
             raise DeployError("Refusing a symlink in the CI storage layout")
         created = not directory.exists()
@@ -157,7 +164,7 @@ def prepare_storage(root):
             raise DeployError("CI storage is not writable; use --setup-host once or ask the host administrator") from None
 
 
-def setup_host(root):
+def setup_host(root, *, proxy_only=False):
     """Only the explicit bootstrap flag grants sudo operations. Never restart users/services."""
     user = getpass.getuser()
     # The explicit flag allows a visible sudo prompt once; later commands never
@@ -174,6 +181,17 @@ def setup_host(root):
     if missing:
         run(["sudo", "-n", "apt-get", "update"], timeout=600)
         run(["sudo", "-n", "apt-get", "install", "-y", *missing, "ca-certificates"], timeout=1200)
+    if proxy_only:
+        # A proxy deployment does not require Docker, NPU groups, or runner changes.
+        # Keep all existing shared directory ownership and permissions intact.
+        for path, mode in storage_layout(root, proxy_only=True):
+            if path.is_symlink():
+                raise DeployError("Refusing a symlink in the CI storage layout")
+            if not path.exists():
+                run(["sudo", "-n", "install", "-d", "-m", format(mode, "04o"),
+                     "-o", user, "-g", str(os.getgid()), str(path)])
+        run(["sudo", "-n", "loginctl", "enable-linger", user])
+        return
     try:
         grp.getgrnam("docker")
     except KeyError:
@@ -197,15 +215,20 @@ def setup_host(root):
         raise DeployError("Host setup completed. New group membership needs a fresh login; log out/in and rerun without --setup-host. Existing user services were left running")
 
 
-def preflight(root, image, *, require_image=True):
+def preflight(root, image, *, require_image=True, proxy_only=False):
     checks = {}
-    for command in ("bash", "curl", "tar", "gzip", "unzip", "sha256sum", "docker", "systemctl", "loginctl", "flock"):
+    commands = ["bash", "curl", "tar", "gzip", "unzip", "sha256sum", "systemctl", "loginctl", "flock", "timeout"]
+    if not proxy_only:
+        commands.append("docker")
+    for command in commands:
         checks["command:" + command] = bool(shutil.which(command))
-    checks["storage"] = all(writable_directory(path) for path, _ in storage_layout(root))
+    checks["storage"] = all(writable_directory(path) for path, _ in storage_layout(root, proxy_only=proxy_only))
     linger = run(["loginctl", "show-user", getpass.getuser(), "--property=Linger", "--value"], check=False)
     checks["linger"] = linger.returncode == 0 and linger.stdout.strip() == "yes"
     manager = systemctl("show-environment", check=False)
     checks["user_systemd"] = manager.returncode == 0
+    if proxy_only:
+        return checks
     if checks["command:docker"]:
         checks["docker"] = run(["docker", "info", "--format", "{{.ServerVersion}}"], check=False).returncode == 0
         if checks["user_systemd"]:
@@ -261,14 +284,31 @@ def download(url, destination, *, digest=None, gh_proxy="https://ghfast.top", en
         raise DeployError("Download destination must not be a symlink")
     if destination.is_file() and digest and sha256(destination) == digest:
         return
-    urls = [url, gh_proxy.rstrip("/") + "/" + url]
+    # The first attempt is always direct, even when the runner login inherited
+    # proxyon. A verified local proxy is used only after direct access fails.
+    direct_env = (env if env is not None else os.environ).copy()
+    for key in (*PROXY_KEYS, "RUNNER_TOKEN", "FLA_CI_SUBSCRIPTION_URL"):
+        direct_env.pop(key, None)
+    attempts = [(url, direct_env, True)]
+    if env and any(env.get(key) for key in PROXY_KEYS[:6]):
+        proxy_env = env.copy()
+        for key in ("RUNNER_TOKEN", "FLA_CI_SUBSCRIPTION_URL"):
+            proxy_env.pop(key, None)
+        attempts.append((url, proxy_env, False))
+    attempts.append((gh_proxy.rstrip("/") + "/" + url, direct_env, True))
     part = destination.with_name(destination.name + ".part")
     if part.is_symlink():
         raise DeployError("Partial download must not be a symlink")
-    for candidate in urls:
-        result = run(["curl", "--fail", "--location", "--silent", "--show-error",
+    for candidate, attempt_env, direct in attempts:
+        command = ["curl", "--disable", "--fail", "--location", "--silent", "--show-error",
                       "--connect-timeout", "15", "--max-time", "600", "--retry", "2",
-                      "--output", str(part), candidate], timeout=1900, check=False, env=env)
+                      "--output", str(part)]
+        if direct:
+            command += ["--noproxy", "*"]
+        else:
+            command += ["--noproxy", ""]
+        command.append(candidate)
+        result = run(command, timeout=1900, check=False, env=attempt_env)
         if result.returncode == 0 and part.is_file() and (not digest or sha256(part) == digest):
             part.replace(destination)
             return
@@ -296,10 +336,9 @@ def proxy_environment(root):
     script = root / "vpn-proxy.sh"
     result = run(["bash", "-ec", 'source "$1"; proxyon >/dev/null; env -0', "proxy-env", str(script)], env=user_env())
     env = user_env()
-    allowed = {"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY"}
     for item in result.stdout.split("\0"):
         key, _, value = item.partition("=")
-        if key in allowed:
+        if key in PROXY_KEYS:
             env[key] = value
     return env
 
@@ -317,6 +356,108 @@ def proxy_health(root):
                 str(runtime)], check=False).returncode == 0
 
 
+def proxy_connectivity(root):
+    """Check the deployed helper and real HTTPS traffic without starting a service."""
+    script = root / "vpn-proxy.sh"
+    if not script.is_file():
+        return False
+    return run(["bash", "-ec", 'source "$1"; proxycheck', "proxy-check", str(script)],
+               env=user_env(), timeout=45, check=False).returncode == 0
+
+
+def install_proxy_helper(root):
+    script = root / "vpn-proxy.sh"
+    template = Path(__file__).with_name("vpn-proxy.sh").read_bytes()
+    if script.is_symlink():
+        raise DeployError("Proxy helper must not be a symlink")
+    if script.is_file() and script.read_bytes() == template:
+        return
+    # Preserve a pre-existing helper once, without ever copying subscription data
+    # into public logs or modifying an active runner's environment.
+    backup = root / "vpn-proxy.sh.before-update"
+    if script.is_file() and not backup.exists():
+        write_private(backup, script.read_text())
+    temporary = root / "vpn-proxy.sh.new"
+    write_private(temporary, template.decode())
+    temporary.chmod(0o644)
+    temporary.replace(script)
+
+
+def ensure_proxy_service(root):
+    """Adopt existing private config, but never start a second listener over it."""
+    home = root / "clashctl"
+    unit = systemctl("cat", PROXY_UNIT, check=False)
+    if unit.returncode == 0:
+        if str(home / "bin/mihomo") not in unit.stdout:
+            raise DeployError("mihomo.service belongs to another deployment; refusing to replace it")
+        return
+    if service_active(PROXY_UNIT):
+        raise DeployError("Unknown active mihomo.service; refusing to replace it")
+    ports = run([str(home / "bin/yq"), "-r", '.port, ."mixed-port", ."socks-port"',
+                 str(home / "data/runtime.yaml")]).stdout.splitlines()
+    for value in ports:
+        if not value.isdigit() or not 1 <= int(value) <= 65535:
+            continue
+        try:
+            with socket.create_connection(("127.0.0.1", int(value)), timeout=1):
+                pass
+        except OSError:
+            continue
+        raise DeployError("Proxy port already has a listener without this user's mihomo.service; identify its owner and migrate only that deployment before rerunning")
+    path = Path.home() / ".config/systemd/user" / PROXY_UNIT
+    if path.exists() or path.is_symlink():
+        raise DeployError("Unrecognized mihomo unit exists; refusing to overwrite it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_private(path, f"""[Unit]
+Description=Flash Linear Attention CI user proxy
+After=network-online.target
+
+[Service]
+ExecStart={home}/bin/mihomo -d {home}/resources -f {home}/data/runtime.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""")
+    systemctl("daemon-reload")
+
+
+def ensure_proxy_shell_hook(root):
+    """Expose proxyon/proxyoff in future Bash logins without enabling a proxy."""
+    path = Path.home() / ".bashrc"
+    if path.is_symlink():
+        raise DeployError("Refusing to modify a symlinked .bashrc; source vpn-proxy.sh explicitly")
+    content = path.read_text() if path.exists() else ""
+    start = "# >>> fla-npu-ci proxy >>>"
+    end = "# <<< fla-npu-ci proxy <<<"
+    block = f'{start}\nif [ -r "{root}/vpn-proxy.sh" ]; then source "{root}/vpn-proxy.sh"; fi\n{end}'
+    if start in content or end in content:
+        if content.count(start) != 1 or content.count(end) != 1 or content.index(start) > content.index(end):
+            raise DeployError("Malformed managed proxy block in .bashrc; repair it or source vpn-proxy.sh explicitly")
+        before, tail = content.split(start, 1)
+        _, after = tail.split(end, 1)
+        updated = before + block + after
+    else:
+        updated = content.rstrip("\n") + "\n\n" + block + "\n"
+    if updated != content:
+        path.write_text(updated)
+
+
+def ensure_proxy_ready(root):
+    ensure_proxy_service(root)
+    install_proxy_helper(root)
+    ensure_proxy_shell_hook(root)
+    if not service_active(PROXY_UNIT):
+        systemctl("start", PROXY_UNIT)
+    if systemctl("is-enabled", PROXY_UNIT, check=False).returncode:
+        systemctl("enable", PROXY_UNIT)
+    # proxyon waits for the listener, but never restarts an active service.
+    proxy_environment(root)
+    if not proxy_connectivity(root):
+        raise DeployError("Proxy HTTPS check failed; source vpn-proxy.sh and run proxycheck, then inspect clashctl subscription/selected node")
+
+
 def ensure_proxy(args, root):
     home = root / "clashctl"
     script = root / "vpn-proxy.sh"
@@ -326,14 +467,8 @@ def ensure_proxy(args, root):
     marker = scratch / "owned-install.json"
     owned_install = {"home": str(home), "commit": CLASHCTL_REV}
     retry_owned = marker.is_file() and marker.read_text() == json.dumps(owned_install)
-    if home.exists() and any(home.iterdir()) and proxy_health(root) and script.is_file():
-        unit = systemctl("cat", PROXY_UNIT, check=False)
-        if unit.returncode or str(home / "bin/mihomo") not in unit.stdout:
-            raise DeployError("mihomo.service belongs to another deployment; refusing to replace it")
-        if not service_active(PROXY_UNIT):
-            systemctl("start", PROXY_UNIT)
-        if systemctl("is-enabled", PROXY_UNIT, check=False).returncode:
-            systemctl("enable", PROXY_UNIT)
+    if home.exists() and any(home.iterdir()) and proxy_health(root):
+        ensure_proxy_ready(root)
         return
     if home.exists() and any(home.iterdir()) and not retry_owned:
         raise DeployError("Existing clashctl installation is incomplete; refusing to replace it. Repair its subscription/service first")
@@ -375,11 +510,7 @@ def ensure_proxy(args, root):
             raise DeployError("Proxy installer failed/timed out; inspect private proxy-bootstrap/install.log") from None
     if result.returncode or not proxy_health(root):
         raise DeployError("Proxy install/subscription validation failed; inspect private proxy-bootstrap/install.log (it may contain the subscription URL)")
-    template = Path(__file__).with_name("vpn-proxy.sh").read_bytes()
-    script.write_bytes(template)
-    script.chmod(0o644)
-    if not service_active(PROXY_UNIT):
-        systemctl("start", PROXY_UNIT)
+    ensure_proxy_ready(root)
 
 
 def runner_unit_text(root):
@@ -529,12 +660,13 @@ def build_image(args, root, config):
 
 
 def check_deployment(args, root, config):
-    checks = preflight(root, args.image)
+    checks = preflight(root, args.image, proxy_only=args.proxy_only)
     checks["proxy_config"] = proxy_health(root)
     checks["proxy_active"] = service_active(PROXY_UNIT)
     checks["proxy_enabled"] = systemctl("is-enabled", PROXY_UNIT, check=False).returncode == 0
+    checks["proxy_https"] = proxy_connectivity(root)
     name = None
-    if not args.skip_runner:
+    if not args.skip_runner and not args.proxy_only:
         identity = existing_runner(root, args.repo_url, args.runner_name)
         checks["runner_identity"] = identity is not None
         name = identity["agentName"] if identity else None
@@ -557,6 +689,7 @@ def parser():
     p.add_argument("--runner-name")
     p.add_argument("--secret-file", help="Current-user-owned 0600 JSON with subscription_url and/or runner_token")
     p.add_argument("--skip-runner", action="store_true")
+    p.add_argument("--proxy-only", action="store_true", help="Only deploy/check the user proxy; do not require Docker, NPU, image or runner")
     p.add_argument("--check", action="store_true", help="Read-only validation; no install, service start or reconfiguration")
     p.add_argument("--setup-host", action="store_true", help="Allow one-time targeted sudo group/directory/linger setup")
     p.add_argument("--gh-proxy", default="https://ghfast.top")
@@ -587,16 +720,18 @@ def main(argv=None):
             if args.setup_host or args.build_image:
                 raise DeployError("--check cannot be combined with mutating bootstrap/build options")
             return check_deployment(args, root, config)
+        if args.proxy_only and args.build_image:
+            raise DeployError("--proxy-only cannot be combined with --build-image")
         os.umask(0o077)
         args.secrets = load_secret_file(args.secret_file) if args.secret_file else {}
         if args.setup_host:
-            setup_host(root)
-        prepare_storage(root)
-        require_checks(preflight(root, args.image, require_image=not args.build_image))
+            setup_host(root, proxy_only=args.proxy_only)
+        prepare_storage(root, proxy_only=args.proxy_only)
+        require_checks(preflight(root, args.image, require_image=not args.build_image, proxy_only=args.proxy_only))
         ensure_proxy(args, root)
         if args.build_image:
             build_image(args, root, config)
-        name = None if args.skip_runner else ensure_runner(args, root, config)
+        name = None if args.skip_runner or args.proxy_only else ensure_runner(args, root, config)
         print("Deployment ready" + (f": {name}" if name else ": proxy and host prerequisites"))
         return check_deployment(args, root, config)
     except DeployError as exc:
