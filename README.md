@@ -89,6 +89,18 @@ bash deploy.sh --platform a5 --proxy-only --check
 
 已有 clashctl 属于其他用户时，以原配置所有者执行部署。helper 提供的 `clashctl`、`proxyon` 会以配置所有者读取端口、调用官方 CLI 和用户服务；跨用户调用需要现有的 `sudo -n -u <配置所有者>` 权限，不放宽订阅配置权限。配置保存在 `clashctl/data`，mihomo 的资源工作目录固定为 `clashctl/resources`，避免启动时重新下载已有的地理数据。
 
+首次部署和重复部署都会在 `clashctl/data/mixin.yaml` 的 `rules.prepend` 首位维护 GitHub Actions 结果上传规则：
+
+```yaml
+rules:
+  prepend:
+    - DOMAIN-SUFFIX,blob.core.windows.net,🚀节点选择
+```
+
+优先使用订阅中的 `🚀节点选择`，没有该名称时使用订阅的首个代理组；没有代理组则提示修复订阅。该规则优先于订阅中可能存在的 `DOMAIN-SUFFIX,windows.net,DIRECT`，避免 Azure Blob 上传被强制直连而超时。部署会保留其他规则和端口设置，修改前分别创建权限为 `0600` 的 `mixin.yaml.bak-*`、`runtime.yaml.bak-*`，调用 clashctl 官方合并及 mihomo 校验后，通过本地控制接口热加载活动中的 mihomo。配置合并或热加载失败会恢复原配置并报错；不重启 runner。规则已生效时重复部署不会重复追加、备份或热加载。仅执行 `--check` 不修改配置。
+
+已有机器更新仓库后，由 clashctl 配置所有者执行 `bash deploy.sh --platform a5 --proxy-only` 即可补齐（A2 使用 `--platform a2`）。无需重新提供订阅或 runner token。
+
 本地健康检查与服务管理：
 
 ```bash

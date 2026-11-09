@@ -19,6 +19,9 @@ import subprocess
 import sys
 import tarfile
 import time
+from urllib.error import URLError
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
 RUNNER_VERSION = "2.338.0"
 CLASHCTL_REV = "e38d643725594c38c3fb02f355a2c89eba9c296c"
@@ -26,6 +29,7 @@ CLASHCTL_REV = "e38d643725594c38c3fb02f355a2c89eba9c296c"
 CLASHCTL_SHA256 = "172e68840d6b81e454950f90e81439fc0ca424e589b1f2f5de36aa9a39d12fef"
 RUNNER_UNIT = "fla-npu-runner.service"
 PROXY_UNIT = "mihomo.service"
+ACTIONS_BLOB_DOMAIN = "blob.core.windows.net"
 PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
               "no_proxy", "NO_PROXY", "GIT_HTTP_PROXY", "GIT_HTTPS_PROXY")
 PLATFORMS = {
@@ -119,7 +123,7 @@ def secret_value(args, name):
 def write_private(path, text):
     if path.is_symlink():
         raise DeployError("Refusing to write through a symlink")
-    with path.open("w") as stream:
+    with path.open("w", encoding="utf-8") as stream:
         stream.write(text)
     path.chmod(0o600)
 
@@ -366,6 +370,84 @@ def proxy_connectivity(root):
                env=user_env(), timeout=45, check=False).returncode == 0
 
 
+def actions_proxy_rule(config):
+    """Use an existing subscription group, never a fabricated policy or DIRECT."""
+    groups = [group["name"] for group in config.get("proxy-groups", [])
+              if group.get("name") and group["name"] not in {"DIRECT", "REJECT"}]
+    if not groups:
+        raise DeployError("GitHub Actions Blob routing requires a proxy group; repair the clashctl subscription")
+    policy = "🚀节点选择" if "🚀节点选择" in groups else groups[0]
+    return f"DOMAIN-SUFFIX,{ACTIONS_BLOB_DOMAIN},{policy}"
+
+
+def reload_proxy_config(home):
+    """Hot reload over the local controller, without exposing its private secret."""
+    config = json.loads(run([str(home / "bin/yq"), "-o=json", ".",
+                             str(home / "data/runtime.yaml")]).stdout)
+    try:
+        address = urlsplit("http://" + config.get("external-controller", ""))
+        if address.hostname not in {"127.0.0.1", "localhost", "0.0.0.0", "::", "::1"} or not address.port:
+            raise ValueError
+        host = "[::1]" if ":" in address.hostname else "127.0.0.1"
+        # JSON is valid YAML. Inline content avoids SAFE_PATHS restrictions on
+        # data/runtime.yaml when the service works from resources/.
+        request = Request(f"http://{host}:{address.port}/configs", method="PUT",
+                          data=json.dumps({"payload": json.dumps(config, ensure_ascii=False)}).encode(),
+                          headers={"Content-Type": "application/json",
+                                   "Authorization": "Bearer " + (config.get("secret") or "")})
+        # Never send localhost controller credentials through an inherited proxy.
+        with build_opener(ProxyHandler({})).open(request, timeout=30) as response:
+            response.read()
+    except (OSError, URLError, ValueError):
+        raise DeployError("mihomo hot reload failed; check the local external-controller/secret and mihomo logs") from None
+
+
+def ensure_actions_proxy_rule(root):
+    """Persist the artifact-upload exception before subscription DIRECT rules."""
+    home = root / "clashctl"
+    mixin, runtime = home / "data/mixin.yaml", home / "data/runtime.yaml"
+    if mixin.is_symlink() or runtime.is_symlink():
+        raise DeployError("Proxy configuration files must not be symlinks")
+    yq = str(home / "bin/yq")
+    config = json.loads(run([yq, "-o=json", ".", str(runtime)]).stdout)
+    rule = actions_proxy_rule(config)
+    prepend = json.loads(run([yq, "-o=json", ".rules.prepend // []", str(mixin)]).stdout)
+    if not isinstance(prepend, list) or any(not isinstance(item, str) for item in prepend):
+        raise DeployError("clashctl mixin rules.prepend must be a list of routing rules")
+    # Replace older Blob exceptions, retaining all unrelated rules and their order.
+    rules = [rule] + [item for item in prepend if
+                     [part.strip().lower() for part in item.split(",")[:2]] !=
+                     ["domain-suffix", ACTIONS_BLOB_DOMAIN]]
+    if prepend == rules and (config.get("rules") or [])[:1] == [rule]:
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}"
+    originals = {path: path.read_text(encoding="utf-8") for path in (mixin, runtime)}
+    for path, content in originals.items():
+        write_private(path.with_name(path.name + ".bak-" + stamp), content)
+    merged = False
+    try:
+        run([yq, "-i", ".rules.prepend = " + json.dumps(rules, ensure_ascii=False), str(mixin)])
+        env = user_env()
+        env["CLASHCTL_HOME"] = str(home)
+        # The official merge validates a candidate with mihomo before replacing
+        # runtime.yaml. Do not use _merge_config_restart: jobs may be uploading.
+        run(["bash", "-ec", 'source "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; _merge_config'], env=env)
+        merged = True
+        if service_active(PROXY_UNIT):
+            reload_proxy_config(home)
+    except DeployError:
+        for path, content in originals.items():
+            write_private(path, content)
+        # A reload may have succeeded before its HTTP response was lost.
+        if merged and service_active(PROXY_UNIT):
+            try:
+                reload_proxy_config(home)
+            except DeployError:
+                pass
+        raise DeployError("Actions Blob proxy update failed; original mixin/runtime restored. Check mihomo configuration and local controller, then rerun deployment") from None
+    print("Actions Blob proxy rule persisted; configuration backups: " + str(mixin.parent / ("*.bak-" + stamp)))
+
+
 def install_proxy_helper(root):
     script = root / "vpn-proxy.sh"
     template = Path(__file__).with_name("vpn-proxy.sh").read_bytes()
@@ -447,6 +529,7 @@ def ensure_proxy_shell_hook(root):
 
 def ensure_proxy_ready(root):
     ensure_proxy_service(root)
+    ensure_actions_proxy_rule(root)
     install_proxy_helper(root)
     ensure_proxy_shell_hook(root)
     if not service_active(PROXY_UNIT):

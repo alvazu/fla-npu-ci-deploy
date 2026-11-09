@@ -232,6 +232,7 @@ class DeployTests(unittest.TestCase):
     def test_active_proxy_is_refreshed_and_checked_without_restart(self):
         root = Path("/home/ubuntu/ci")
         with patch.object(deploy, "ensure_proxy_service") as service, \
+                patch.object(deploy, "ensure_actions_proxy_rule") as routes, \
                 patch.object(deploy, "install_proxy_helper") as helper, \
                 patch.object(deploy, "ensure_proxy_shell_hook"), \
                 patch.object(deploy, "service_active", return_value=True), \
@@ -240,12 +241,14 @@ class DeployTests(unittest.TestCase):
                 patch.object(deploy, "proxy_connectivity", return_value=True):
             deploy.ensure_proxy_ready(root)
         service.assert_called_once_with(root)
+        routes.assert_called_once_with(root)
         helper.assert_called_once_with(root)
         environment.assert_called_once_with(root)
         systemctl.assert_called_once_with("is-enabled", deploy.PROXY_UNIT, check=False)
 
     def test_proxy_without_github_connectivity_reports_repair_advice(self):
         with patch.object(deploy, "ensure_proxy_service"), \
+                patch.object(deploy, "ensure_actions_proxy_rule"), \
                 patch.object(deploy, "install_proxy_helper"), \
                 patch.object(deploy, "ensure_proxy_shell_hook"), \
                 patch.object(deploy, "service_active", return_value=True), \
@@ -369,6 +372,126 @@ class DeployTests(unittest.TestCase):
                 tar.addfile(member)
             with self.assertRaises(deploy.DeployError):
                 deploy.extract_archive(archive, root / "target")
+
+
+class ActionsProxyTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.home = self.root / "clashctl"
+        (self.home / "data").mkdir(parents=True)
+        self.mixin = self.home / "data/mixin.yaml"
+        self.runtime = self.home / "data/runtime.yaml"
+        self.mixin.write_text(json.dumps({"port": 7899, "rules": {
+            "prepend": ["DOMAIN,keep.example,DIRECT",
+                        "DOMAIN-SUFFIX,blob.core.windows.net,DIRECT"],
+            "append": ["MATCH,DIRECT"]}}), encoding="utf-8")
+        self.base_rules = ["DOMAIN-SUFFIX,windows.net,DIRECT", "MATCH,🚀节点选择"]
+        self.runtime.write_text(json.dumps({"proxy-groups": [{"name": "🚀节点选择"}],
+                                          "rules": self.base_rules}), encoding="utf-8")
+        self.originals = {path: path.read_bytes() for path in (self.mixin, self.runtime)}
+        self.merge_error = False
+        self.merges = 0
+        self.addCleanup(patch.stopall)
+        patch.object(deploy, "run", side_effect=self.fake_run).start()
+        patch.object(deploy, "user_env", return_value={}).start()
+        self.active = patch.object(deploy, "service_active", return_value=True).start()
+        self.reload = patch.object(deploy, "reload_proxy_config").start()
+
+    def fake_run(self, args, **kwargs):
+        if args[0] == "bash":
+            self.assertIn("_merge_config", args[-1])
+            self.assertNotIn("restart", args[-1])
+            self.assertEqual(kwargs["env"]["CLASHCTL_HOME"], str(self.home))
+            self.merges += 1
+            if self.merge_error:
+                raise deploy.DeployError("invalid candidate")
+            config = json.loads(self.runtime.read_text(encoding="utf-8"))
+            config["rules"] = json.loads(self.mixin.read_text(encoding="utf-8"))["rules"]["prepend"] + self.base_rules
+            self.runtime.write_text(json.dumps(config), encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        path = Path(args[-1])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if "-i" in args:
+            data["rules"]["prepend"] = json.loads(args[-2].split(" = ", 1)[1])
+            path.write_text(json.dumps(data), encoding="utf-8")
+        elif args[-2] == ".rules.prepend // []":
+            data = data["rules"]["prepend"]
+        return subprocess.CompletedProcess(args, 0, json.dumps(data), "")
+
+    def test_blob_rule_precedes_direct_preserves_other_config_and_is_idempotent(self):
+        deploy.ensure_actions_proxy_rule(self.root)
+        mixin = json.loads(self.mixin.read_text(encoding="utf-8"))
+        rule = "DOMAIN-SUFFIX,blob.core.windows.net,🚀节点选择"
+        self.assertEqual(mixin["rules"]["prepend"], [rule, "DOMAIN,keep.example,DIRECT"])
+        self.assertEqual(mixin["port"], 7899)
+        self.assertEqual(mixin["rules"]["append"], ["MATCH,DIRECT"])
+        self.assertEqual(json.loads(self.runtime.read_text(encoding="utf-8"))["rules"][0], rule)
+        backups = sorted((self.home / "data").glob("*.bak-*"))
+        self.assertEqual(len(backups), 2)
+        for path in backups:
+            original = self.home / "data" / path.name.split(".bak-", 1)[0]
+            self.assertEqual(path.read_bytes(), self.originals[original])
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        deploy.ensure_actions_proxy_rule(self.root)
+        self.assertEqual(len(list((self.home / "data").glob("*.bak-*"))), 2)
+        self.assertEqual(self.merges, 1)
+        self.reload.assert_called_once_with(self.home)
+
+    def test_inactive_proxy_gets_persistent_rules_without_reload(self):
+        self.active.return_value = False
+        deploy.ensure_actions_proxy_rule(self.root)
+        self.assertEqual(self.merges, 1)
+        self.reload.assert_not_called()
+
+    def test_failed_validation_restores_both_files_without_reloading(self):
+        self.merge_error = True
+        with self.assertRaisesRegex(deploy.DeployError, "original mixin/runtime restored"):
+            deploy.ensure_actions_proxy_rule(self.root)
+        for path, original in self.originals.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.reload.assert_not_called()
+
+    def test_failed_reload_restores_files_and_reloads_original_config(self):
+        self.reload.side_effect = [deploy.DeployError("reload failed"), None]
+        with self.assertRaisesRegex(deploy.DeployError, "original mixin/runtime restored"):
+            deploy.ensure_actions_proxy_rule(self.root)
+        for path, original in self.originals.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.reload.call_count, 2)
+
+    def test_alternative_subscription_group_and_missing_group(self):
+        self.assertEqual(deploy.actions_proxy_rule({"proxy-groups": [{"name": "Proxy"}]}),
+                         "DOMAIN-SUFFIX,blob.core.windows.net,Proxy")
+        with self.assertRaisesRegex(deploy.DeployError, "requires a proxy group"):
+            deploy.actions_proxy_rule({"proxy-groups": [{"name": "DIRECT"}]})
+
+
+class ProxyReloadTests(unittest.TestCase):
+    def test_reload_uses_authenticated_loopback_and_disables_inherited_proxy(self):
+        config = {"external-controller": "0.0.0.0:9099", "secret": "private-controller-secret",
+                  "proxy-groups": [{"name": "🚀节点选择"}]}
+        with patch.object(deploy, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(config))), \
+                patch.object(deploy, "build_opener") as opener:
+            deploy.reload_proxy_config(Path("/ci/clashctl"))
+            self.assertEqual(opener.call_args.args[0].proxies, {})
+            request = opener.return_value.open.call_args.args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:9099/configs")
+            self.assertEqual(request.method, "PUT")
+            self.assertEqual(request.get_header("Authorization"), "Bearer private-controller-secret")
+            self.assertEqual(json.loads(json.loads(request.data)["payload"]), config)
+            # YAML rejects JSON surrogate-pair escapes for the emoji group name.
+            self.assertIn("🚀节点选择", json.loads(request.data)["payload"])
+
+    def test_reload_error_does_not_expose_controller_secret(self):
+        config = {"external-controller": "127.0.0.1:9099", "secret": "private-controller-secret"}
+        with patch.object(deploy, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(config))), \
+                patch.object(deploy, "build_opener", side_effect=OSError("private-controller-secret")):
+            with self.assertRaises(deploy.DeployError) as error:
+                deploy.reload_proxy_config(Path("/ci/clashctl"))
+        self.assertNotIn("private-controller-secret", str(error.exception))
 
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "Linux Bash proxy fixture")
